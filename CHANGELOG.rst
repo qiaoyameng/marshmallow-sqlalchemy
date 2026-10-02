@@ -4,6 +4,14 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add optional bulk resolution of `Related` fields for ``many=True`` loads.
+  Enable it with the ``bulk_related`` Meta option or the ``bulk_related``
+  argument to ``Schema.load`` to resolve related objects with batched queries
+  (chunked by the ``bulk_related_batch_size`` Meta option) instead of
+  per-item lookups.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.

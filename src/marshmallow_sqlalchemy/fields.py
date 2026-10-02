@@ -12,6 +12,11 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.declarative import DeclarativeMeta
     from sqlalchemy.orm import MapperProperty
 
+#: Sentinel marking related keys that were bulk-resolved to no matching row.
+_MISSING = object()
+#: Sentinel marking values that were not collected during bulk resolution.
+_NOT_COLLECTED = object()
+
 
 class RelatedList(fields.List):
     def get_value(self, obj, attr, accessor=None):
@@ -104,6 +109,13 @@ class Related(fields.Field):
             value = {self.related_keys[0].key: value}
         if self.transient:
             return self.related_model(**value)
+        cached = self._get_bulk_cached(value)
+        if cached is _MISSING:
+            # Bulk resolution found no matching row; deserialize the value
+            # so it can be added to the DB later.
+            return self.related_model(**value)
+        if cached is not _NOT_COLLECTED:
+            return cached
         try:
             result = self._get_existing_instance(self.related_model, value)
         except NoResultFound:
@@ -111,6 +123,21 @@ class Related(fields.Field):
             # ...perhaps we want to add it to the DB later
             return self.related_model(**value)
         return result
+
+    def _get_bulk_cached(self, value):
+        """Return the bulk-resolved result for ``value`` if the root schema
+        is performing a bulk load, else ``_NOT_COLLECTED``.
+        """
+        cache = getattr(self.root, "_related_cache", None)
+        if cache is None:
+            return _NOT_COLLECTED
+        props = self.related_keys
+        group_key = (self.related_model, tuple(prop.key for prop in props))
+        key = (group_key, tuple(value.get(prop.key) for prop in props))
+        try:
+            return cache.get(key, _NOT_COLLECTED)
+        except TypeError:  # unhashable key components
+            return _NOT_COLLECTED
 
     def _get_existing_instance(self, related_model, value):
         """Retrieve the related object from an existing instance in the DB.
