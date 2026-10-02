@@ -14,6 +14,13 @@ if TYPE_CHECKING:
 
 
 class RelatedList(fields.List):
+    def __init__(self, cls_or_instance, **kwargs):
+        # `require_existing` is handled by the inner `Related` field, which
+        # receives it through the model converter. It is not a valid
+        # `fields.List` keyword argument, so it is dropped here.
+        kwargs.pop("require_existing", None)
+        super().__init__(cls_or_instance, **kwargs)
+
     def get_value(self, obj, attr, accessor=None):
         # Do not call `fields.List`'s get_value as it calls the container's
         # `get_value` if the container has `attribute`.
@@ -29,17 +36,35 @@ class Related(fields.Field):
 
     :param columns: Optional column names on related model. If not provided,
         the primary key(s) of the related model will be used.
+    :param require_existing: If `True`, deserialization follows an
+        "existing-only" strategy: the related value must resolve to a record
+        that already exists, and a validation error is raised otherwise.
+        Objects registered in the session but not yet committed
+        (``session.new``) are considered existing and may be referenced.
+        The lookup never triggers an autoflush, so deserialization cannot
+        cause unrelated writes to the database. If `False` (the default),
+        a new transient instance is created when no matching record exists,
+        preserving the historical behavior. This option has no effect when
+        the schema is transient, since transient loading never uses the
+        session.
     """
 
     default_error_messages = {
         "invalid": "Could not deserialize related value {value!r}; "
-        "expected a dictionary with keys {keys!r}"
+        "expected a dictionary with keys {keys!r}",
+        "not_found": "Could not find related object with keys {keys!r} "
+        "for value {value!r}",
+        "incomplete_key": "Missing related key(s) {missing!r}; "
+        "expected a dictionary with keys {keys!r}",
+        "no_session": "Could not resolve related object without a "
+        "SQLAlchemy session",
     }
 
     def __init__(
         self,
         columns: list[str] | str | None = None,
         column: str | None = None,
+        require_existing: bool = False,
         **kwargs,
     ):
         if column is not None:
@@ -53,6 +78,7 @@ class Related(fields.Field):
                 columns = column
         super().__init__(**kwargs)
         self.columns: list[str] = ensure_list(columns or [])
+        self.require_existing = require_existing
 
     @property
     def model(self) -> type[DeclarativeMeta] | None:
@@ -104,6 +130,8 @@ class Related(fields.Field):
             value = {self.related_keys[0].key: value}
         if self.transient:
             return self.related_model(**value)
+        if self.require_existing:
+            return self._get_required_instance(value)
         try:
             result = self._get_existing_instance(self.related_model, value)
         except NoResultFound:
@@ -111,6 +139,51 @@ class Related(fields.Field):
             # ...perhaps we want to add it to the DB later
             return self.related_model(**value)
         return result
+
+    def _get_required_instance(self, value):
+        """Retrieve an existing related object, or raise a validation error.
+
+        Only existing records are bound: objects registered in the session
+        but not yet committed (``session.new``) and records persisted in the
+        database are both valid targets. No new instance is ever created,
+        and the database lookup is performed with autoflush disabled so that
+        deserialization cannot trigger unrelated writes.
+
+        :param value: The serialized value to map to an existing instance.
+        :raises ValidationError: if no session is available, if the key is
+            incomplete, or if no matching record exists.
+        """
+        keys = [prop.key for prop in self.related_keys]
+        if self.session is None:
+            raise self.make_error("no_session")
+        missing = [key for key in keys if value.get(key) is None]
+        if missing:
+            raise self.make_error("incomplete_key", missing=missing, keys=keys)
+        pending = self._get_pending_instance(value)
+        if pending is not None:
+            return pending
+        # `no_autoflush` guarantees the lookup cannot flush unrelated
+        # pending changes to the database as a side effect of deserializing.
+        with self.session.no_autoflush:
+            try:
+                return self._get_existing_instance(self.related_model, value)
+            except NoResultFound:
+                raise self.make_error("not_found", value=value, keys=keys) from None
+
+    def _get_pending_instance(self, value):
+        """Return a matching object registered in the session but not yet
+        committed, or `None` if there is no match.
+
+        Pending objects are valid deserialization targets: they are already
+        registered in the session and will be persisted on the next flush.
+        """
+        for obj in self.session.new:
+            if isinstance(obj, self.related_model) and all(
+                getattr(obj, prop.key, None) == value.get(prop.key)
+                for prop in self.related_keys
+            ):
+                return obj
+        return None
 
     def _get_existing_instance(self, related_model, value):
         """Retrieve the related object from an existing instance in the DB.

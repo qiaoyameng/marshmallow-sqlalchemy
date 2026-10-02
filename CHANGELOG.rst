@@ -4,6 +4,16 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add ``require_existing`` option to `~marshmallow_sqlalchemy.fields.Related`.
+  When enabled, deserialization only binds related objects that already exist
+  (persisted in the database or pending in the session) and raises a
+  validation error otherwise, instead of creating a new transient instance.
+  The lookup never triggers an autoflush. The option is also honored by
+  auto-generated relationship fields, e.g. via
+  ``auto_field(require_existing=True)``.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.
