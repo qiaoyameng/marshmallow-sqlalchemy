@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from importlib.metadata import version
 
 import marshmallow
@@ -10,7 +11,7 @@ from pytest_lazy_fixtures import lf
 
 from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, SQLAlchemySchema, auto_field
 from marshmallow_sqlalchemy.exceptions import IncorrectSchemaTypeError
-from marshmallow_sqlalchemy.fields import Related
+from marshmallow_sqlalchemy.fields import Related, RelatedList
 
 # -----------------------------------------------------------------------------
 
@@ -750,3 +751,277 @@ def test_dumping_pickle_field(models, teacher):
     assert schema.dump(teacher) == {
         "data": {"foo": "bar"},
     }
+
+
+class TestRelatedRequireExisting:
+    @pytest.fixture
+    def student_schema(self, models, session):
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = Related(require_existing=True)
+
+        return StudentSchema()
+
+    def test_existing_object_is_bound(self, models, session, school, student_schema):
+        student = student_schema.load({"full_name": "New Kid", "current_school": 42})
+        assert student.current_school is school
+
+    def test_missing_object_raises(self, models, session, school, student_schema):
+        with pytest.raises(ValidationError) as excinfo:
+            student_schema.load({"full_name": "New Kid", "current_school": 999})
+        errors = excinfo.value.messages
+        assert "current_school" in errors
+        assert "Could not find existing related object" in str(
+            errors["current_school"]
+        )
+        # The failed load must not leave anything pending in the session,
+        # must not write new rows, and must not touch existing relations.
+        assert len(session.new) == 0
+        assert session.query(models.School).count() == 1
+        assert session.query(models.Student).count() == 2
+
+    def test_failed_load_preserves_existing_instance(
+        self, models, session, school, student_schema
+    ):
+        student = models.Student(
+            id=1, full_name="Existing", current_school=school
+        )
+        session.add(student)
+        session.flush()
+        with pytest.raises(ValidationError):
+            student_schema.load(
+                {"full_name": "Renamed", "current_school": 999}, instance=student
+            )
+        assert student.full_name == "Existing"
+        assert student.current_school is school
+        assert len(session.new) == 0
+
+    def test_pending_object_is_referenceable(
+        self, models, session, student_schema
+    ):
+        pending_school = models.School(id=77, name="Pending School")
+        session.add(pending_school)
+        student = student_schema.load({"full_name": "New Kid", "current_school": 77})
+        assert student.current_school is pending_school
+
+    def test_no_session_raises(self, models, school):
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+
+            full_name = auto_field()
+            current_school = Related(require_existing=True)
+
+        with pytest.raises(ValidationError) as excinfo:
+            StudentSchema().load({"full_name": "New Kid", "current_school": 42})
+        assert "no session is available" in str(excinfo.value.messages)
+
+    def test_transient_raises(self, models, session, school, student_schema):
+        with pytest.raises(ValidationError) as excinfo:
+            student_schema.load(
+                {"full_name": "New Kid", "current_school": 42}, transient=True
+            )
+        assert "no session is available" in str(excinfo.value.messages)
+
+    def test_composite_key(self, models, session):
+        seminar = models.Seminar(title="Algebra", semester="Fall")
+        session.add(seminar)
+        session.flush()
+
+        class LectureSchema(SQLAlchemySchema[models.Lecture]):
+            class Meta:
+                model = models.Lecture
+                sqla_session = session
+                load_instance = True
+
+            topic = auto_field()
+            seminar = Related(require_existing=True)
+
+        schema = LectureSchema()
+        lecture = schema.load(
+            {
+                "topic": "Linear maps",
+                "seminar": {"title": "Algebra", "semester": "Fall"},
+            }
+        )
+        assert lecture.seminar is seminar
+
+        # Incomplete composite key
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"topic": "Linear maps", "seminar": {"title": "Algebra"}})
+        assert "missing values for keys" in str(excinfo.value.messages)
+
+        # Complete key that does not exist
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load(
+                {
+                    "topic": "Linear maps",
+                    "seminar": {"title": "Algebra", "semester": "Spring"},
+                }
+            )
+        assert "Could not find existing related object" in str(excinfo.value.messages)
+
+    def test_custom_columns(self, models, session, school):
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = Related(["id", "name"], require_existing=True)
+
+        schema = StudentSchema()
+        student = schema.load(
+            {
+                "full_name": "New Kid",
+                "current_school": {"id": 42, "name": "Univ. Of Whales"},
+            }
+        )
+        assert student.current_school is school
+
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load(
+                {
+                    "full_name": "New Kid",
+                    "current_school": {"id": 42, "name": "Wrong Name"},
+                }
+            )
+        assert "Could not find existing related object" in str(excinfo.value.messages)
+
+    def test_custom_columns_find_pending_object(self, models, session):
+        pending_school = models.School(id=77, name="Pending School")
+        session.add(pending_school)
+
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = Related(["id", "name"], require_existing=True)
+
+        student = StudentSchema().load(
+            {
+                "full_name": "New Kid",
+                "current_school": {"id": 77, "name": "Pending School"},
+            }
+        )
+        assert student.current_school is pending_school
+
+    def test_lookup_does_not_autoflush(self, models, session, school):
+        # A pending object that would fail on flush must not be flushed
+        # as a side effect of deserializing a related value.
+        session.add(models.Student(full_name=None, current_school=school))
+
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = Related(["id", "name"], require_existing=True)
+
+        student = StudentSchema().load(
+            {
+                "full_name": "New Kid",
+                "current_school": {"id": 42, "name": "Univ. Of Whales"},
+            }
+        )
+        assert student.current_school is school
+
+    def test_allow_none(self, models, session, school):
+        class TeacherSchema(SQLAlchemySchema[models.Teacher]):
+            class Meta:
+                model = models.Teacher
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = Related(require_existing=True, allow_none=True)
+
+        teacher = TeacherSchema().load(
+            {"full_name": "No School", "current_school": None}
+        )
+        assert teacher.current_school is None
+
+    def test_related_list_errors_keep_path_structure(
+        self, models, session, school
+    ):
+        course = models.Course(
+            id=1,
+            name="Math",
+            cost=1.0,
+            level="Primary",
+            level_with_enum_class="PRIMARY",
+            has_prereqs=False,
+            started=dt.datetime(2020, 1, 1),
+            grade=1,
+            transcription="t",
+        )
+        session.add(course)
+        session.flush()
+
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            courses = RelatedList(Related(require_existing=True))
+
+        schema = StudentSchema()
+        student = schema.load({"full_name": "New Kid", "courses": [1]})
+        assert student.courses == [course]
+
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"full_name": "New Kid", "courses": [1, 999]})
+        errors = excinfo.value.messages
+        assert list(errors["courses"].keys()) == [1]
+        assert "Could not find existing related object" in str(errors["courses"][1])
+
+    def test_default_behavior_unchanged(self, models, session, school):
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = Related()
+
+        student = StudentSchema().load({"full_name": "New Kid", "current_school": 999})
+        # Without require_existing, a new transient instance is created
+        assert student.current_school.id == 999
+        assert student.current_school not in session
+
+    def test_auto_generated_relationship_field(self, models, session, school):
+        class StudentSchema(SQLAlchemySchema[models.Student]):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+                load_instance = True
+
+            full_name = auto_field()
+            current_school = auto_field(require_existing=True)
+            courses = auto_field(require_existing=True)
+
+        schema = StudentSchema()
+        assert schema.fields["current_school"].require_existing is True
+        assert schema.fields["courses"].inner.require_existing is True
+
+        student = schema.load({"full_name": "New Kid", "current_school": 42})
+        assert student.current_school is school
+
+        with pytest.raises(ValidationError):
+            schema.load({"full_name": "New Kid", "current_school": 999})
+        with pytest.raises(ValidationError):
+            schema.load({"full_name": "New Kid", "courses": [999]})

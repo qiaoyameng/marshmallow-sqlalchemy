@@ -14,6 +14,14 @@ if TYPE_CHECKING:
 
 
 class RelatedList(fields.List):
+    def __init__(self, cls_or_instance, **kwargs):
+        # `require_existing` applies to the inner `Related` field, not the
+        # list itself, so it must not be forwarded to `fields.List`.
+        require_existing = kwargs.pop("require_existing", None)
+        super().__init__(cls_or_instance, **kwargs)
+        if require_existing is not None and isinstance(self.inner, Related):
+            self.inner.require_existing = require_existing
+
     def get_value(self, obj, attr, accessor=None):
         # Do not call `fields.List`'s get_value as it calls the container's
         # `get_value` if the container has `attribute`.
@@ -29,17 +37,32 @@ class Related(fields.Field):
 
     :param columns: Optional column names on related model. If not provided,
         the primary key(s) of the related model will be used.
+    :param require_existing: If `True`, deserialization only accepts values
+        that identify an existing related object. A validation error is raised
+        when the key is incomplete, when no matching row exists, or when no
+        session is available to perform the lookup. Objects that are pending
+        in the session (registered but not yet committed) are valid targets.
+        The lookup never triggers an autoflush. Defaults to `False`, which
+        preserves the historical behavior of creating a new (transient)
+        instance when no existing object is found.
     """
 
     default_error_messages = {
         "invalid": "Could not deserialize related value {value!r}; "
-        "expected a dictionary with keys {keys!r}"
+        "expected a dictionary with keys {keys!r}",
+        "does_not_exist": "Could not find existing related object "
+        "with keys {keys!r} matching {value!r}",
+        "incomplete_key": "Could not deserialize related value {value!r}; "
+        "missing values for keys {keys!r}",
+        "no_session": "Could not deserialize related value {value!r}; "
+        "an existing object is required but no session is available",
     }
 
     def __init__(
         self,
         columns: list[str] | str | None = None,
         column: str | None = None,
+        require_existing: bool = False,
         **kwargs,
     ):
         if column is not None:
@@ -53,6 +76,7 @@ class Related(fields.Field):
                 columns = column
         super().__init__(**kwargs)
         self.columns: list[str] = ensure_list(columns or [])
+        self.require_existing = require_existing
 
     @property
     def model(self) -> type[DeclarativeMeta] | None:
@@ -95,6 +119,8 @@ class Related(fields.Field):
 
         If the parent schema is transient, create a new (transient) instance.
         Otherwise, attempt to find an existing instance in the database.
+        If ``require_existing`` is `True`, only existing instances are
+        returned and a validation error is raised otherwise.
         :param value: The value to deserialize.
         """
         if not isinstance(value, dict):
@@ -102,6 +128,8 @@ class Related(fields.Field):
                 keys = [prop.key for prop in self.related_keys]
                 raise self.make_error("invalid", value=value, keys=keys)
             value = {self.related_keys[0].key: value}
+        if self.require_existing:
+            return self._get_required_instance(self.related_model, value)
         if self.transient:
             return self.related_model(**value)
         try:
@@ -111,6 +139,71 @@ class Related(fields.Field):
             # ...perhaps we want to add it to the DB later
             return self.related_model(**value)
         return result
+
+    def _get_required_instance(self, related_model, value):
+        """Retrieve an existing related object, never creating a new one.
+
+        :param related_model: The related model to query
+        :param value: The serialized value to map to an existing instance.
+        :raises ValidationError: if the key is incomplete, if no session is
+            available, or if there is no matching record.
+        """
+        keys = [prop.key for prop in self.related_keys]
+        if self.transient or self.session is None:
+            raise self.make_error("no_session", value=value, keys=keys)
+        missing_keys = [key for key in keys if value.get(key) is None]
+        if missing_keys:
+            raise self.make_error("incomplete_key", value=value, keys=missing_keys)
+        # Pending (unflushed) objects registered in the session are valid
+        # targets; match them in memory before hitting the database.
+        result = self._get_pending_by_keys(related_model, value)
+        if result is not None:
+            return result
+        if self.columns:
+            result = self._get_existing_by_columns(related_model, value)
+        else:
+            # `no_autoflush` guarantees the lookup never flushes unrelated
+            # pending changes to the database.
+            lookup_values = [value.get(prop.key) for prop in self.related_keys]
+            try:
+                with self.session.no_autoflush:
+                    result = self.session.get(related_model, lookup_values)
+            except TypeError as error:
+                raise self.make_error("invalid", value=value, keys=keys) from error
+        if result is None:
+            raise self.make_error("does_not_exist", value=value, keys=keys)
+        return result
+
+    def _get_pending_by_keys(self, related_model, value):
+        """Find a matching object among the pending objects of the session."""
+        for obj in self.session.new:
+            if isinstance(obj, related_model) and all(
+                getattr(obj, prop.key, None) == value.get(prop.key)
+                for prop in self.related_keys
+            ):
+                return obj
+        return None
+
+    def _get_existing_by_columns(self, related_model, value):
+        """Find an existing object by non-primary-key columns.
+
+        The database query runs under ``no_autoflush`` so that
+        deserialization never writes unrelated changes to the database.
+        """
+        with self.session.no_autoflush:
+            try:
+                return (
+                    self.session.query(related_model)
+                    .filter_by(
+                        **{
+                            prop.key: value.get(prop.key)
+                            for prop in self.related_keys
+                        }
+                    )
+                    .one()
+                )
+            except NoResultFound:
+                return None
 
     def _get_existing_instance(self, related_model, value):
         """Retrieve the related object from an existing instance in the DB.

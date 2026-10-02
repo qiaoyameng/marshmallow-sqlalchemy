@@ -4,6 +4,15 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add ``require_existing`` option to `Related <marshmallow_sqlalchemy.fields.Related>`
+  (and `RelatedList <marshmallow_sqlalchemy.fields.RelatedList>`). When enabled,
+  deserialization only accepts values that identify an existing related object
+  instead of creating a new transient instance. The option can also be passed
+  to `auto_field <marshmallow_sqlalchemy.auto_field>` and
+  `field_for <marshmallow_sqlalchemy.field_for>` for relationship fields.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.

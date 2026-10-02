@@ -160,6 +160,43 @@ Serialization will look like this:
         #   'id': 1,
         #   'title': 'Bohemian Rhapsody Revisited'}
 
+Requiring related objects to already exist
+==========================================
+
+By default, deserializing a `Related <marshmallow_sqlalchemy.fields.Related>`
+value that does not match any row creates a new (transient) instance of the
+related model. Pass ``require_existing=True`` to only accept values that
+identify an existing related object.
+
+.. code-block:: python
+
+    class BlogPostSchema(SQLAlchemyAutoSchema):
+        class Meta:
+            model = BlogPost
+
+        id = auto_field()
+        # Only an existing User may be referenced; unknown ids are rejected.
+        author = Related(require_existing=True)
+
+The option also works through ``auto_field`` and
+`field_for <marshmallow_sqlalchemy.field_for>` for relationship fields,
+including collection relationships generated as
+`RelatedList <marshmallow_sqlalchemy.fields.RelatedList>`.
+
+.. code-block:: python
+
+    class BlogPostSchema(SQLAlchemyAutoSchema):
+        class Meta:
+            model = BlogPost
+
+        author = auto_field(require_existing=True)
+
+Deserialization fails with a validation error when the key is incomplete,
+when no matching row exists, or when no session is available. Objects that
+are pending in the session (registered with ``session.add`` but not yet
+committed) may be referenced. The lookup never triggers an autoflush, so
+deserialization cannot write unrelated changes to the database.
+
 Introspecting generated fields
 ==============================
 
