@@ -67,6 +67,10 @@ class SQLAlchemySchemaOpts(LoadInstanceMixin.Opts, SchemaOpts):
         This is only needed when ``load_instance`` is `True`. You can also pass a session to the Schema's `load` method.
     - ``transient``: Whether to load model instances in a transient state (effectively ignoring the session).
         Only relevant when ``load_instance`` is `True`.
+    - ``batch_related``: Whether to resolve related fields for collection loads
+        in batched queries.
+    - ``related_batch_size``: Maximum number of bound parameters for a batched
+        related query.
     - ``model_converter``: `ModelConverter` class to use for converting the SQLAlchemy model to marshmallow fields.
     """
 

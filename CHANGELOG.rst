@@ -4,6 +4,12 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add optional batched ``Related`` lookup for collection loads. Pass
+  ``batch_related=True`` to ``Schema.load`` or set it in ``class Meta`` to resolve
+  duplicate related values once per load.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.

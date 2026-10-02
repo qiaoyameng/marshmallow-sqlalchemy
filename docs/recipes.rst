@@ -160,6 +160,30 @@ Serialization will look like this:
         #   'id': 1,
         #   'title': 'Bohemian Rhapsody Revisited'}
 
+Batch loading related objects
+=============================
+
+Loading a collection normally resolves each related value independently, even when
+many records reference the same object. Pass ``batch_related=True`` to
+`Schema.load <marshmallow_sqlalchemy.SQLAlchemySchema.load>` to first collect the
+valid related keys, then issue one query per related model and key set. The
+identity cache is kept only for that load call, so duplicate values in the
+collection resolve to the same ORM instance while later loads remain independent.
+
+.. code-block:: python
+
+    posts = blog_post_schema.load(
+        records,
+        many=True,
+        batch_related=True,
+        related_batch_size=500,
+    )
+
+The same option can be set on ``class Meta`` with ``batch_related = True``.
+``related_batch_size`` limits the number of bound parameters used by each query;
+for composite keys it is divided by the number of key columns. Missing related
+objects continue to use the normal field fallback behavior.
+
 Introspecting generated fields
 ==============================
 

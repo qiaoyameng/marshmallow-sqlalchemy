@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+from contextlib import contextmanager
 from importlib.metadata import version
 
 import marshmallow
@@ -10,7 +12,9 @@ from pytest_lazy_fixtures import lf
 
 from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, SQLAlchemySchema, auto_field
 from marshmallow_sqlalchemy.exceptions import IncorrectSchemaTypeError
-from marshmallow_sqlalchemy.fields import Related
+from marshmallow_sqlalchemy.fields import Related, RelatedBatch, RelatedList
+
+from .conftest import CourseLevel
 
 # -----------------------------------------------------------------------------
 
@@ -484,6 +488,428 @@ def test_related_when_model_attribute_name_distinct_from_column_name(
     new_teacher = TeacherSchema().load(dump_data, transient=True)
     assert new_teacher.current_school.id == teacher.current_school.id
     assert TeacherSchema().load(dump_data) is teacher
+
+
+@contextmanager
+def count_selects(engine):
+    statements = []
+
+    def before_cursor_execute(
+        conn,
+        cursor,
+        statement,
+        parameters,
+        context,
+        executemany,
+    ):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    sa.event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        yield statements
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", before_cursor_execute)
+
+
+class TestBatchRelated:
+    def test_reuses_results_for_duplicate_related_keys(self, models, session, engine):
+        schools = [models.School(id=1, name="First"), models.School(id=2, name="Second")]
+        session.add_all(schools)
+        session.flush()
+
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        with count_selects(engine) as statements:
+            students = schema.load(
+                [
+                    {"full_name": "One", "current_school": 1},
+                    {"full_name": "Two", "current_school": 1},
+                    {"full_name": "Three", "current_school": 2},
+                    {"full_name": "Four", "current_school": 2},
+                    {"full_name": "Missing", "current_school": 3},
+                ],
+                many=True,
+                batch_related=True,
+            )
+
+        assert len(statements) == 1
+        assert students[0].current_school is schools[0]
+        assert students[1].current_school is schools[0]
+        assert students[2].current_school is schools[1]
+        assert students[3].current_school is schools[1]
+        assert isinstance(students[4].current_school, models.School)
+
+    def test_reuses_objects_already_in_session_identity_map(
+        self, models, session, engine
+    ):
+        school = models.School(id=1, name="First")
+        session.add(school)
+        session.flush()
+
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        with count_selects(engine) as statements:
+            students = schema.load(
+                [
+                    {"full_name": "One", "current_school": 1},
+                    {"full_name": "Two", "current_school": 1},
+                ],
+                many=True,
+                batch_related=True,
+            )
+
+        assert statements == []
+        assert students[0].current_school is school
+        assert students[1].current_school is school
+
+    def test_can_enable_batch_related_in_meta(self, models, session, engine):
+        session.add(models.School(id=1, name="First"))
+        session.flush()
+
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                load_instance = True
+                sqla_session = session
+                batch_related = True
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        with count_selects(engine) as statements:
+            students = schema.load(
+                [
+                    {"full_name": "One", "current_school": 1},
+                    {"full_name": "Two", "current_school": 1},
+                ],
+                many=True,
+            )
+
+        assert len(statements) == 1
+        assert students[0].current_school is students[1].current_school
+
+    def test_resolves_related_list_in_one_query(self, models, session, engine):
+        courses = [
+            models.Course(
+                id=1,
+                name="First",
+                cost=1,
+                level="Primary",
+                level_with_enum_class=CourseLevel.PRIMARY,
+                has_prereqs=False,
+                started=dt.datetime.now(),
+                grade=1,
+                transcription="one",
+            ),
+            models.Course(
+                id=2,
+                name="Second",
+                cost=2,
+                level="Primary",
+                level_with_enum_class=CourseLevel.PRIMARY,
+                has_prereqs=False,
+                started=dt.datetime.now(),
+                grade=2,
+                transcription="two",
+            ),
+        ]
+        session.add_all(courses)
+        session.flush()
+        for course in courses:
+            session.expunge(course)
+
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+            courses = RelatedList(Related())
+
+        school = models.School(id=1, name="School")
+        session.add(school)
+        schema = StudentSchema()
+        with count_selects(engine) as statements:
+            students = schema.load(
+                [
+                    {
+                        "full_name": "One",
+                        "current_school": 1,
+                        "courses": [1, 2],
+                    },
+                    {
+                        "full_name": "Two",
+                        "current_school": 1,
+                        "courses": [1],
+                    },
+                ],
+                many=True,
+                batch_related=True,
+            )
+
+        assert len(statements) == 2
+        assert students[0].courses[0] is students[1].courses[0]
+        assert students[0].courses[1].id == courses[1].id
+        assert students[0].courses[0].id == courses[0].id
+
+    def test_resolves_composite_primary_keys(self, models, session, engine):
+        seminar = models.Seminar(title="ORM", semester="Fall")
+        session.add(seminar)
+        session.flush()
+        session.expunge(seminar)
+
+        class LectureSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Lecture
+                sqla_session = session
+
+            topic = auto_field()
+            seminar = Related()
+
+        schema = LectureSchema()
+        with count_selects(engine) as statements:
+            lectures = schema.load(
+                [
+                    {"topic": "First", "seminar": {"title": "ORM", "semester": "Fall"}},
+                    {"topic": "Second", "seminar": {"title": "ORM", "semester": "Fall"}},
+                ],
+                many=True,
+                batch_related=True,
+            )
+
+        assert len(statements) == 1
+        assert lectures[0]["seminar"] is lectures[1]["seminar"]
+        assert lectures[0]["seminar"].title == seminar.title
+
+    def test_resolves_custom_columns_in_one_query(self, models, session, engine):
+        schools = [
+            models.School(id=1, name="First"),
+            models.School(id=2, name="Second"),
+        ]
+        session.add_all(schools)
+        session.flush()
+
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related(["id", "name"])
+
+        schema = StudentSchema()
+        with count_selects(engine) as statements:
+            students = schema.load(
+                [
+                    {"full_name": "One", "current_school": {"id": 1, "name": "First"}},
+                    {"full_name": "Two", "current_school": {"id": 2, "name": "Second"}},
+                ],
+                many=True,
+                batch_related=True,
+            )
+
+        assert len(statements) == 1
+        assert students[0]["current_school"] is schools[0]
+        assert students[1]["current_school"] is schools[1]
+
+    def test_limits_number_of_parameters_per_query(self, models, session, engine):
+        session.add_all(
+            [models.School(id=id_, name=f"School {id_}") for id_ in range(1, 7)]
+        )
+        session.flush()
+
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        with count_selects(engine) as statements:
+            schema.load(
+                [
+                    {"full_name": str(id_), "current_school": id_}
+                    for id_ in range(1, 7)
+                ],
+                many=True,
+                batch_related=True,
+                related_batch_size=3,
+            )
+
+        assert len(statements) == 2
+        assert all(statement.count("?") <= 3 for statement, _ in statements)
+
+    def test_limits_parameters_for_composite_keys(self, models, session, engine):
+        session.add_all(
+            [
+                models.Seminar(title=f"Title {id_}", semester=f"Term {id_}")
+                for id_ in range(1, 5)
+            ]
+        )
+        session.flush()
+
+        class LectureSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Lecture
+                sqla_session = session
+
+            topic = auto_field()
+            seminar = Related()
+
+        schema = LectureSchema()
+        with count_selects(engine) as statements:
+            schema.load(
+                [
+                    {
+                        "topic": str(id_),
+                        "seminar": {
+                            "title": f"Title {id_}",
+                            "semester": f"Term {id_}",
+                        },
+                    }
+                    for id_ in range(1, 5)
+                ],
+                many=True,
+                batch_related=True,
+                related_batch_size=4,
+            )
+
+        assert len(statements) == 2
+        assert all(len(parameters) <= 5 for _, parameters in statements)
+
+    def test_missing_related_fallbacks_are_not_shared_across_loads(
+        self, models, session
+    ):
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        first = schema.load(
+            [
+                {"full_name": "One", "current_school": 99},
+                {"full_name": "Two", "current_school": 99},
+            ],
+            many=True,
+            batch_related=True,
+        )
+        second = schema.load(
+            [{"full_name": "Three", "current_school": 99}],
+            many=True,
+            batch_related=True,
+        )
+
+        assert first[0]["current_school"] is first[1]["current_school"]
+        assert second[0]["current_school"] is not first[0]["current_school"]
+
+    def test_batch_related_override_does_not_persist_across_loads(
+        self, models, session
+    ):
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        schema.load(
+            [{"full_name": "One", "current_school": 1}],
+            many=True,
+            batch_related=True,
+        )
+
+        assert schema._batch_related is False
+        assert schema._related_batch is None
+
+    def test_validation_errors_keep_original_indexes(self, models, session):
+        class LectureSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Lecture
+                sqla_session = session
+
+            topic = auto_field()
+            seminar = Related()
+
+        schema = LectureSchema()
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(
+                [
+                    {"topic": "Valid", "seminar": {"title": "ORM", "semester": "Fall"}},
+                    {"topic": "Invalid", "seminar": "ORM"},
+                ],
+                many=True,
+                batch_related=True,
+            )
+
+        assert tuple(exc_info.value.messages) == (1,)
+        assert "seminar" in exc_info.value.messages[1]
+
+    def test_failed_query_does_not_store_partial_results(self, models, session):
+        class StudentSchema(SQLAlchemySchema):
+            class Meta:
+                model = models.Student
+                sqla_session = session
+
+            full_name = auto_field()
+            current_school = Related()
+
+        schema = StudentSchema()
+        original_query_chunk = RelatedBatch._query_chunk
+
+        def failing_query_chunk(batch, field, related_model, keys, found):
+            if len(keys) == 3 and keys[0] == (4,):
+                raise RuntimeError("query failed")
+            return original_query_chunk(
+                batch, field, related_model, keys, found
+            )
+
+        RelatedBatch._query_chunk = failing_query_chunk
+        try:
+            with pytest.raises(RuntimeError, match="query failed"):
+                schema.load(
+                    [
+                        {"full_name": str(id_), "current_school": id_}
+                        for id_ in range(1, 7)
+                    ],
+                    many=True,
+                    batch_related=True,
+                    related_batch_size=3,
+                )
+        finally:
+            RelatedBatch._query_chunk = original_query_chunk
+
+        assert schema._related_batch is None
+        assert not any(
+            "current_school" in obj.__dict__ for obj in session.new
+        )
 
 
 # https://github.com/marshmallow-code/marshmallow-sqlalchemy/issues/338

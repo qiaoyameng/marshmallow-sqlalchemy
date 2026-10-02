@@ -16,7 +16,7 @@ import marshmallow as ma
 from sqlalchemy.ext.declarative import DeclarativeMeta
 from sqlalchemy.orm.exc import ObjectDeletedError
 
-from .fields import get_primary_keys
+from .fields import RelatedBatch, get_primary_keys
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -39,6 +39,8 @@ class LoadInstanceMixin:
         sqla_session: Session | None
         load_instance: bool
         transient: bool
+        batch_related: bool
+        related_batch_size: int
 
         def __init__(self, meta, *args, **kwargs):
             super().__init__(meta, *args, **kwargs)
@@ -46,6 +48,11 @@ class LoadInstanceMixin:
             self.sqla_session = getattr(meta, "sqla_session", None)
             self.load_instance = getattr(meta, "load_instance", False)
             self.transient = getattr(meta, "transient", False)
+            self.batch_related = getattr(meta, "batch_related", False)
+            related_batch_size = getattr(meta, "related_batch_size", 500)
+            if not isinstance(related_batch_size, int) or related_batch_size < 1:
+                raise ValueError("`related_batch_size` must be a positive integer.")
+            self.related_batch_size = related_batch_size
 
     class Schema(Generic[_ModelType]):
         opts: LoadInstanceMixin.Opts
@@ -53,6 +60,9 @@ class LoadInstanceMixin:
         _session: Session | None
         _transient: bool | None
         _load_instance: bool
+        _batch_related: bool
+        _related_batch_size: int
+        _related_batch: RelatedBatch | None
 
         @property
         def session(self) -> Session | None:
@@ -79,6 +89,16 @@ class LoadInstanceMixin:
             self.instance = kwargs.pop("instance", None)
             self._transient = kwargs.pop("transient", None)
             self._load_instance = kwargs.pop("load_instance", self.opts.load_instance)
+            self._batch_related = kwargs.pop(
+                "batch_related", self.opts.batch_related
+            )
+            related_batch_size = kwargs.pop(
+                "related_batch_size", self.opts.related_batch_size
+            )
+            if not isinstance(related_batch_size, int) or related_batch_size < 1:
+                raise ValueError("`related_batch_size` must be a positive integer.")
+            self._related_batch_size = related_batch_size
+            self._related_batch = None
             super().__init__(*args, **kwargs)
 
         def get_instance(self, data) -> _ModelType | None:
@@ -129,6 +149,8 @@ class LoadInstanceMixin:
             session: Session | None = None,
             instance: _ModelType | None = None,
             transient: bool = False,
+            batch_related: bool | None = None,
+            related_batch_size: int | None = None,
             **kwargs,
         ) -> Any:
             """Deserialize data. If ``load_instance`` is set to `True`
@@ -138,17 +160,78 @@ class LoadInstanceMixin:
             :param session: SQLAlchemy `session <sqlalchemy.orm.Session>`.
             :param instance: Existing model instance to modify.
             :param transient: If `True`, load transient model instance(s).
+            :param batch_related: If `True`, resolve related fields for collections
+                in batched queries.
+            :param related_batch_size: Maximum number of bound parameters in a
+                batched related query.
             :param kwargs: Same keyword arguments as `marshmallow.Schema.load`.
             """
+            if related_batch_size is None:
+                related_batch_size = kwargs.pop(
+                    "batch_size", self._related_batch_size
+                )
+            elif "batch_size" in kwargs:
+                raise ValueError(
+                    "Cannot pass both `related_batch_size` and `batch_size`."
+                )
+            if not isinstance(related_batch_size, int) or related_batch_size < 1:
+                raise ValueError("`related_batch_size` must be a positive integer.")
+
             self._session = session or self._session
             self._transient = transient or self._transient
             if self._load_instance and not (self.transient or self.session):
                 raise ValueError("Deserialization requires a session")
             self.instance = instance or self.instance
+            previous_batch_related = self._batch_related
+            previous_related_batch_size = self._related_batch_size
+            batch_related = (
+                self._batch_related if batch_related is None else batch_related
+            )
+            self._batch_related = batch_related
+            self._related_batch_size = related_batch_size
             try:
                 return cast("ma.Schema", super()).load(_cast_data(data), **kwargs)
             finally:
                 self.instance = None
+                self._related_batch = None
+                self._batch_related = previous_batch_related
+                self._related_batch_size = previous_related_batch_size
+
+        def _deserialize(
+            self,
+            data,
+            *,
+            error_store,
+            many: bool = False,
+            partial=None,
+            unknown=None,
+            index=None,
+        ):
+            use_batch = bool(
+                many
+                and getattr(self, "_batch_related", False)
+                and not self.transient
+                and self.session is not None
+            )
+            if use_batch:
+                self._related_batch = RelatedBatch(
+                    self,
+                    data,
+                    session=cast("Session", self.session),
+                    batch_size=cast("int", getattr(self, "_related_batch_size")),
+                )
+            try:
+                return super()._deserialize(
+                    data,
+                    error_store=error_store,
+                    many=many,
+                    partial=partial,
+                    unknown=unknown,
+                    index=index,
+                )
+            finally:
+                if use_batch:
+                    self._related_batch = None
 
         def validate(
             self,
