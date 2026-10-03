@@ -8,6 +8,13 @@ Other changes:
 
 * Drop support for marshmallow 3, which is EOL.
 
+Features:
+
+* Add ``two_phase`` support to ``SQLAlchemySchema.load`` and
+  ``SQLAlchemyAutoSchema.load``. With ``many=True``, all input is validated
+  before existing model instances are modified; repeated primary-key targets
+  in the same relationship collection are reported as validation errors.
+
 1.5.0 (2026-04-01)
 ++++++++++++++++++
 

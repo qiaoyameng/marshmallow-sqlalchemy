@@ -424,3 +424,32 @@ You can override the schema ``load_instance`` flag by passing in a ``load_instan
     # <Author(name='John Steinbeck')>
     print(AuthorSchema(load_instance=False).load(dump_data))  # loading a dict
     # {"id": 1, "name": "John Steinbeck"}
+
+
+Validating collections before updates
+=====================================
+
+When loading multiple existing objects, pass ``two_phase=True`` with
+``many=True`` to validate every input item before applying any changes:
+
+.. code-block:: python
+
+    authors = AuthorSchema().load(
+        [
+            {"id": 1, "name": "Updated name"},
+            {"id": 2, "name": "Another updated name"},
+        ],
+        many=True,
+        two_phase=True,
+    )
+
+The first phase deserializes and validates all input, including nested schemas,
+and creates an in-memory update plan. Existing instances, their relationships,
+and session contents are only modified after all input is valid. Validation
+does not flush the session, and a failed validation does not call
+``Session.rollback()``, so unrelated work in the caller's session is preserved.
+
+If the same primary key appears more than once in the same top-level or
+relationship collection, marshmallow raises a validation error rather than
+applying multiple updates to one target. Successful loads return the instances
+from the session's identity map.

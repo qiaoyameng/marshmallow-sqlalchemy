@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING, Any, cast
 
-from marshmallow import fields
+from marshmallow import ValidationError, fields
 from marshmallow.utils import is_iterable_but_not_string
 from sqlalchemy import inspect
 from sqlalchemy.orm.exc import NoResultFound
@@ -20,6 +20,41 @@ class RelatedList(fields.List):
         # Instead call the `get_value` from the parent of `fields.List`
         # so the special handling is avoided.
         return super(fields.List, self).get_value(obj, attr, accessor=accessor)
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        if (
+            isinstance(value, list)
+            and getattr(self.root, "_load_instance", False)
+            and getattr(self.root, "_load_phase", None) == "validate"
+        ):
+            targets = set()
+            for index, item in enumerate(value):
+                raw_value = item
+                try:
+                    related_keys = self.inner.related_keys
+                    if not isinstance(raw_value, dict):
+                        if len(related_keys) != 1:
+                            continue
+                        raw_value = {related_keys[0].key: item}
+                    key = tuple(
+                        raw_value.get(prop.key) for prop in related_keys
+                    )
+                    if None in key:
+                        continue
+                    if key in targets:
+                        raise ValidationError(
+                            {
+                                index: [
+                                    "Duplicate target for "
+                                    f"{self.inner.related_model.__name__}: "
+                                    + ",".join(str(part) for part in key)
+                                ]
+                            }
+                        )
+                    targets.add(key)
+                except RuntimeError:
+                    return super()._deserialize(value, attr, data, **kwargs)
+        return super()._deserialize(value, attr, data, **kwargs)
 
 
 class Related(fields.Field):
@@ -129,7 +164,14 @@ class Related(fields.Field):
             )
         else:
             # Use a faster path if the related key is the primary key.
-            lookup_values = [value.get(prop.key) for prop in self.related_keys]
+            lookup_values = tuple(
+                value.get(prop.key) for prop in self.related_keys
+            )
+            lookup_values = (
+                next(iter(lookup_values))
+                if len(lookup_values) == 1
+                else lookup_values
+            )
             try:
                 result = self.session.get(related_model, lookup_values)
             except TypeError as error:
@@ -143,10 +185,42 @@ class Related(fields.Field):
 class Nested(fields.Nested):
     """Nested field that inherits the session from its parent."""
 
+    def _load(self, value, partial=None):
+        schema = self.schema
+        if hasattr(schema, "session"):
+            schema.session = self.root.session
+            schema.transient = self.root.transient
+        phase = (
+            getattr(self.root, "_load_phase", None)
+            if hasattr(schema, "_load_phase")
+            and getattr(schema, "_load_instance", False)
+            else None
+        )
+        previous_two_phase = getattr(schema, "_two_phase", False)
+        if phase is not None:
+            schema._load_phase = phase
+            schema._two_phase = True
+        try:
+            if phase == "validate":
+                try:
+                    return schema._do_load(
+                        value,
+                        many=schema.many,
+                        partial=partial,
+                        unknown=self.unknown,
+                        postprocess=True,
+                    )
+                except ValidationError as error:
+                    raise ValidationError(
+                        error.messages, valid_data=error.valid_data
+                    ) from error
+            return super()._load(value, partial=partial)
+        finally:
+            if phase is not None:
+                schema._load_phase = None
+                schema._two_phase = previous_two_phase
+
     def _deserialize(self, *args, **kwargs):
-        if hasattr(self.schema, "session"):
-            self.schema.session = self.root.session
-            self.schema.transient = self.root.transient
         return super()._deserialize(*args, **kwargs)
 
 

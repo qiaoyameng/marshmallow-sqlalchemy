@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import datetime as dt
+
 from importlib.metadata import version
 
 import marshmallow
 import pytest
 import sqlalchemy as sa
-from marshmallow import Schema, ValidationError, fields, validate
+from marshmallow import (
+    Schema,
+    ValidationError,
+    fields,
+    post_load,
+    validate,
+    validates_schema,
+)
 from pytest_lazy_fixtures import lf
 
 from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, SQLAlchemySchema, auto_field
 from marshmallow_sqlalchemy.exceptions import IncorrectSchemaTypeError
-from marshmallow_sqlalchemy.fields import Related
+from marshmallow_sqlalchemy.fields import Nested, Related
 
 # -----------------------------------------------------------------------------
 
@@ -462,6 +471,342 @@ class TestModelInstanceDeserialization:
 
         schema = TeacherSchema(transient=False)
         assert schema.transient is False
+
+
+class TestTwoPhaseLoading:
+    def test_many_validates_all_inputs_before_applying_updates(self, models, session):
+        school = models.School(id=42, name="Old school")
+        teacher = models.Teacher(
+            id=24,
+            full_name="Old teacher",
+            current_school=school,
+        )
+        session.add(teacher)
+        session.commit()
+
+        calls = []
+
+        class SchoolSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.School
+                include_fk = True
+                load_instance = True
+                sqla_session = session
+
+            name = auto_field(validate=validate.Length(max=20))
+            id = auto_field()
+
+            @post_load
+            def count_hook(self, data, **kwargs):
+                calls.append(("school", data["id"]))
+                return data
+
+        class TeacherSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.Teacher
+                include_fk = True
+                include_relationships = True
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field(validate=validate.Length(max=20))
+            id = auto_field()
+            current_school = Nested(SchoolSchema)
+
+            @post_load
+            def count_hook(self, data, **kwargs):
+                calls.append(("teacher", data["id"]))
+                return data
+
+        schema = TeacherSchema()
+        school = session.get(models.School, 42)
+        teacher = session.get(models.Teacher, 24)
+        valid_teacher = {
+            "id": 24,
+            "full_name": "New teacher",
+            "current_school": {"id": 42, "name": "New school"},
+        }
+        invalid_input = [
+            valid_teacher,
+            {
+                "id": 25,
+                "full_name": "Invalid teacher name!!",
+                "current_school": None,
+            },
+        ]
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(invalid_input, many=True, two_phase=True)
+
+        assert exc_info.value.messages == {
+            1: {
+                "current_school": ["Field may not be null."],
+                "full_name": ["Longer than maximum length 20."],
+            }
+        }
+        assert school.name == "Old school"
+        assert teacher.full_name == "Old teacher"
+        assert teacher.current_school is school
+        assert not session.dirty
+        assert not session.new
+        assert calls == []
+
+        result = schema.load([valid_teacher], many=True, two_phase=True)
+
+        assert result == [teacher]
+        assert result[0] is teacher
+        assert result[0].current_school is school
+        assert teacher.full_name == "New teacher"
+        assert school.name == "New school"
+        assert calls == [("school", 42), ("teacher", 24)]
+
+    def test_many_rejects_repeated_primary_keys_without_updating(self, models, session):
+        teacher = models.Teacher(id=42, full_name="Old teacher")
+        session.add(teacher)
+        session.flush()
+
+        class TeacherSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.Teacher
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field()
+            id = auto_field()
+
+        schema = TeacherSchema()
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(
+                [
+                    {"id": 42, "full_name": "First update"},
+                    {"id": 42, "full_name": "Second update"},
+                ],
+                many=True,
+                two_phase=True,
+            )
+
+        assert exc_info.value.messages == {
+            1: ["Duplicate target for Teacher: 42"]
+        }
+        assert teacher.full_name == "Old teacher"
+        assert not session.dirty
+
+    def test_many_does_not_flush_during_validation_or_application(
+        self, models, session
+    ):
+        pending_teacher = models.Teacher(full_name="Pending teacher")
+        session.add(pending_teacher)
+        flush_count = 0
+
+        def count_flush(*args):
+            nonlocal flush_count
+            flush_count += 1
+
+        sa.event.listen(session, "before_flush", count_flush)
+
+        class TeacherSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.Teacher
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field(validate=validate.Length(max=20))
+
+        schema = TeacherSchema()
+
+        with pytest.raises(ValidationError):
+            schema.load(
+                [{"id": 42, "full_name": "Invalid teacher name!!"}],
+                many=True,
+                two_phase=True,
+            )
+
+        result = schema.load(
+            [{"full_name": "New teacher"}],
+            many=True,
+            two_phase=True,
+        )
+
+        assert result[0].full_name == "New teacher"
+        assert flush_count == 0
+
+    def test_validation_rejects_explicit_flush_without_rollback(
+        self, models, session
+    ):
+        pending_teacher = models.Teacher(full_name="Pending teacher")
+        session.add(pending_teacher)
+
+        class TeacherSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.Teacher
+                load_instance = True
+                sqla_session = session
+
+            full_name = auto_field()
+
+            @validates_schema
+            def flush_during_validation(self, data, **kwargs):
+                session.flush()
+
+        schema = TeacherSchema()
+
+        with pytest.raises(RuntimeError, match="Cannot flush"):
+            schema.load(
+                [{"full_name": "New teacher"}],
+                many=True,
+                two_phase=True,
+            )
+
+        assert pending_teacher in session.new
+        assert sa.inspect(pending_teacher).pending
+
+    def test_nested_collection_rejects_repeated_primary_keys(self, models, session):
+        school = models.School(id=42, name="Old school")
+        students = [
+            models.Student(
+                id=24,
+                full_name="Old student",
+                current_school=school,
+            ),
+            models.Student(
+                id=25,
+                full_name="Other student",
+                current_school=school,
+            ),
+        ]
+        session.add_all(students)
+        session.flush()
+
+        class StudentSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.Student
+                include_fk = True
+                include_relationships = False
+                load_instance = True
+                sqla_session = session
+
+            id = auto_field()
+            full_name = auto_field()
+
+        class SchoolSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.School
+                include_relationships = True
+                load_instance = True
+                sqla_session = session
+
+            id = auto_field()
+            name = auto_field()
+            students = Nested(StudentSchema, many=True)
+
+        schema = SchoolSchema()
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(
+                [
+                    {
+                        "id": 42,
+                        "name": "New school",
+                        "students": [
+                            {
+                                "id": 24,
+                                "full_name": "Updated student",
+                                "current_school_id": 42,
+                            },
+                            {
+                                "id": 24,
+                                "full_name": "Duplicated student",
+                                "current_school_id": 42,
+                            },
+                        ],
+                    }
+                ],
+                many=True,
+                two_phase=True,
+            )
+
+        assert exc_info.value.messages == {
+            0: {"students": {1: ["Duplicate target for Student: 24"]}}
+        }
+        assert school.name == "Old school"
+        assert students[0].full_name == "Old student"
+        assert not session.dirty
+
+    def test_related_collection_rejects_repeated_primary_keys(self, models, session):
+        school = models.School(id=42, name="Old school")
+        course = models.Course(
+            id=10,
+            name="Old course",
+            cost=0,
+            description=None,
+            level="Primary",
+            level_with_enum_class="Primary",
+            has_prereqs=False,
+            started=dt.datetime(2020, 1, 1),
+            grade=1,
+            transcription="",
+        )
+        student = models.Student(
+            id=24,
+            full_name="Old student",
+            current_school=school,
+            courses=[course],
+        )
+        session.add(student)
+        session.flush()
+
+        class StudentSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = models.Student
+                include_fk = True
+                include_relationships = True
+                load_instance = True
+                sqla_session = session
+
+            id = auto_field()
+            full_name = auto_field()
+            courses = auto_field()
+
+        schema = StudentSchema()
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(
+                [
+                    {
+                        "id": 24,
+                        "full_name": "New student",
+                        "current_school": 42,
+                        "current_school_id": 42,
+                        "courses": [10, 10],
+                    }
+                ],
+                many=True,
+                two_phase=True,
+            )
+
+        assert exc_info.value.messages == {
+            0: {"courses": {1: ["Duplicate target for Course: 10"]}}
+        }
+        assert student.full_name == "Old student"
+        assert not session.dirty
+
+        result = schema.load(
+            [
+                {
+                    "id": 24,
+                    "full_name": "Updated student",
+                    "current_school": 42,
+                    "current_school_id": 42,
+                    "courses": [10],
+                }
+            ],
+            many=True,
+            two_phase=True,
+        )
+
+        assert result[0] is student
+        assert result[0].courses == [course]
 
 
 def test_related_when_model_attribute_name_distinct_from_column_name(
