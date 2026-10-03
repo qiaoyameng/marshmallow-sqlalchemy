@@ -5,7 +5,8 @@ from .convert import (
     fields_for_model,
     property2field,
 )
-from .exceptions import ModelConversionError
+from .exceptions import ModelConversionError, UnloadedAttributeError
+from .loaded_only import OMIT, RAISE
 from .schema import (
     SQLAlchemyAutoSchema,
     SQLAlchemyAutoSchemaOpts,
@@ -17,10 +18,13 @@ from .schema import (
 __all__ = [
     "ModelConversionError",
     "ModelConverter",
+    "OMIT",
+    "RAISE",
     "SQLAlchemyAutoSchema",
     "SQLAlchemyAutoSchemaOpts",
     "SQLAlchemySchema",
     "SQLAlchemySchemaOpts",
+    "UnloadedAttributeError",
     "auto_field",
     "column2field",
     "field_for",

@@ -424,3 +424,45 @@ You can override the schema ``load_instance`` flag by passing in a ``load_instan
     # <Author(name='John Steinbeck')>
     print(AuthorSchema(load_instance=False).load(dump_data))  # loading a dict
     # {"id": 1, "name": "John Steinbeck"}
+
+Only serializing loaded data
+============================
+
+Serializing ORM objects normally triggers lazy loads: a deferred column or an
+unloaded relationship issues SQL the moment it is read. When dumping a list of
+objects this can add one query per object (the "N+1" problem).
+
+Set ``loaded_only = True`` to make dumps use only the data already present on
+the SQLAlchemy instances. The ORM instance state is inspected *before* any
+attribute is read, so no lazy load -- and therefore no SQL -- is ever emitted
+during the dump. This also works for expired and detached instances.
+
+.. code-block:: python
+
+    from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, RAISE, OMIT
+
+
+    class AuthorSchema(SQLAlchemyAutoSchema):
+        class Meta:
+            model = Author
+            include_relationships = True
+            loaded_only = True
+            unloaded = RAISE  # the default
+
+
+    authors = session.scalars(select(Author)).all()
+    AuthorSchema().dump(authors, many=True)
+    # UnloadedAttributeError: Cannot serialize 'author_id.biography': ...
+
+Use ``unloaded = OMIT`` to leave unloaded attributes out of the result:
+
+.. code-block:: python
+
+    AuthorSchema(unloaded=OMIT).dump(authors, many=True)
+
+The mode and strategy can also be toggled per schema instance
+(``AuthorSchema(loaded_only=True, unloaded=OMIT)``) or per call
+(``schema.dump(authors, many=True, unloaded=OMIT)``). Nested schemas inherit
+the active strategy, and errors carry the full dotted field path, including
+list indexes. A loaded ``NULL`` is still serialized as ``None``, and field
+``dump_default`` values are never used in place of unloaded attributes.

@@ -4,13 +4,15 @@ import warnings
 from typing import TYPE_CHECKING, Any, cast
 
 from marshmallow import fields
-from marshmallow.utils import is_iterable_but_not_string
+from marshmallow.utils import is_iterable_but_not_string, missing
 from sqlalchemy import inspect
 from sqlalchemy.orm.exc import NoResultFound
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.declarative import DeclarativeMeta
     from sqlalchemy.orm import MapperProperty
+
+from .loaded_only import OMITTED
 
 
 class RelatedList(fields.List):
@@ -87,7 +89,24 @@ class Related(fields.Field):
         return self.root.transient
 
     def _serialize(self, value, attr, obj):
-        ret = {prop.key: getattr(value, prop.key, None) for prop in self.related_keys}
+        from .loaded_only import current_strategy, get_loaded_value
+
+        active = current_strategy() is not None
+        ret = {}
+        for prop in self.related_keys:
+            if active:
+                # The outer field name (e.g. "school") is already on the path.
+                # For composite keys the related column name is appended so the
+                # message points at e.g. "school.name".
+                composite = len(self.related_keys) > 1
+                key_value = get_loaded_value(
+                    value, prop.key, prop.key if composite else None
+                )
+                if key_value is OMITTED:
+                    return missing
+            else:
+                key_value = getattr(value, prop.key, None)
+            ret[prop.key] = key_value
         return ret if len(ret) > 1 else next(iter(ret.values()))
 
     def _deserialize(self, value, *args, **kwargs):
@@ -142,6 +161,53 @@ class Related(fields.Field):
 
 class Nested(fields.Nested):
     """Nested field that inherits the session from its parent."""
+
+    def _serialize(self, nested_obj, attr, obj, **kwargs):
+        from contextlib import ExitStack
+
+        from .loaded_only import current_path, current_strategy, path_segment
+
+        nested_schema = self.schema
+        # The nested serialization is loaded-only when an ancestor already
+        # activated the mode or the nested schema itself enables it.
+        child_mode = getattr(nested_schema, "loaded_only", False)
+        if current_strategy() is None and not child_mode:
+            return super()._serialize(nested_obj, attr, obj, **kwargs)
+        with ExitStack() as stack:
+            # The field name is already on the path inside a SQLAlchemySchema;
+            # a plain marshmallow parent (including a schema enabling the mode
+            # only on the child) needs us to push it here (idempotently).
+            parent_owns_name = (
+                current_strategy() is not None
+                and current_path()
+                and current_path()[-1] == self.name
+            )
+            if not parent_owns_name:
+                stack.enter_context(path_segment(self.name))
+            index = self._index_in_parent(nested_obj, attr, obj)
+            if index is not None:
+                stack.enter_context(path_segment(index))
+            return super()._serialize(nested_obj, attr, obj, **kwargs)
+
+    def _index_in_parent(self, nested_obj, attr, obj):
+        """Return the index of ``nested_obj`` for ``fields.List(Nested(...))``.
+
+        Returns ``None`` for single nested objects. The parent collection is
+        already loaded at this point (the surrounding List field read it), so
+        identity comparison never emits SQL.
+        """
+        inner = getattr(self.parent, "inner", None)
+        if inner is not self:
+            return None
+        try:
+            container = getattr(obj, attr)
+        except AttributeError:
+            return None
+        if is_iterable_but_not_string(container):
+            for index, item in enumerate(container):
+                if item is nested_obj:
+                    return index
+        return None
 
     def _deserialize(self, *args, **kwargs):
         if hasattr(self.schema, "session"):

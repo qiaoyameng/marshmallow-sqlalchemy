@@ -4,6 +4,19 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add a "loaded only" dump mode. When ``loaded_only`` is enabled (via the
+  ``class Meta`` option or the ``Schema(...)``/``dump(...)`` arguments), dumps
+  inspect the SQLAlchemy instance state instead of triggering lazy loads, so
+  serializing a list of objects emits no extra SQL. Deferred columns, expired
+  attributes and unloaded relationships are handled by the ``unloaded``
+  strategy: ``"raise"`` (the default) raises ``UnloadedAttributeError`` with the
+  full dotted field path, while ``"omit"`` skips them. Field ``dump_default``
+  values are never substituted for unloaded attributes, loaded ``NULL`` values
+  are still serialized as ``None``, and the policy is inherited by nested
+  schemas (including detached instances).
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.

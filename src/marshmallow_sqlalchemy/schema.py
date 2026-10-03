@@ -4,11 +4,19 @@ from typing import TYPE_CHECKING, Any, cast
 
 import sqlalchemy as sa
 from marshmallow.fields import Field
+from marshmallow.utils import missing
 from marshmallow.schema import Schema, SchemaMeta, SchemaOpts
 
 from .convert import ModelConverter
 from .exceptions import IncorrectSchemaTypeError
 from .load_instance_mixin import LoadInstanceMixin, _ModelType
+from .loaded_only import (
+    OMITTED,
+    current_strategy,
+    dump_context,
+    path_segment,
+    validate_strategy,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.declarative import DeclarativeMeta
@@ -68,10 +76,17 @@ class SQLAlchemySchemaOpts(LoadInstanceMixin.Opts, SchemaOpts):
     - ``transient``: Whether to load model instances in a transient state (effectively ignoring the session).
         Only relevant when ``load_instance`` is `True`.
     - ``model_converter``: `ModelConverter` class to use for converting the SQLAlchemy model to marshmallow fields.
+    - ``loaded_only``: Whether dumps must only use data already loaded onto the
+        SQLAlchemy instances, never triggering lazy loads. Defaults to `False`.
+    - ``unloaded``: What to do with attributes that are not loaded when
+        ``loaded_only`` is enabled. Either ``"raise"`` (the default) or
+        ``"omit"``.
     """
 
     table: sa.Table | None
     model_converter: type[ModelConverter]
+    loaded_only: bool
+    unloaded: str
 
     def __init__(self, meta, *args, **kwargs):
         super().__init__(meta, *args, **kwargs)
@@ -80,6 +95,10 @@ class SQLAlchemySchemaOpts(LoadInstanceMixin.Opts, SchemaOpts):
         if self.model is not None and self.table is not None:
             raise ValueError("Cannot set both `model` and `table` options.")
         self.model_converter = getattr(meta, "model_converter", ModelConverter)
+        self.loaded_only = getattr(meta, "loaded_only", False)
+        unloaded = getattr(meta, "unloaded", "raise")
+        # Validate eagerly so misconfigured schemas fail at class creation.
+        self.unloaded = validate_strategy(unloaded)
 
 
 class SQLAlchemyAutoSchemaOpts(SQLAlchemySchemaOpts):
@@ -249,6 +268,93 @@ class SQLAlchemySchema(
     """
 
     OPTIONS_CLASS = SQLAlchemySchemaOpts
+
+    _loaded_only: bool
+    _unloaded: str
+
+    def __init__(self, *args, **kwargs):
+        loaded_only = kwargs.pop("loaded_only", None)
+        unloaded = kwargs.pop("unloaded", None)
+        super().__init__(*args, **kwargs)
+        self._loaded_only = (
+            self.opts.loaded_only if loaded_only is None else loaded_only
+        )
+        if unloaded is not None:
+            self._unloaded = validate_strategy(unloaded)
+        else:
+            self._unloaded = self.opts.unloaded
+
+    @property
+    def loaded_only(self) -> bool:
+        """Whether dumps skip lazy loading and only serialize loaded data."""
+        return self._loaded_only
+
+    @property
+    def unloaded(self) -> str:
+        """Strategy for unloaded attributes: ``"raise"`` or ``"omit"``."""
+        return self._unloaded
+
+    def dump(self, obj, *, many=None, loaded_only=None, unloaded=None):
+        active_mode = self.loaded_only if loaded_only is None else loaded_only
+        strategy_active = current_strategy() is not None
+        if not active_mode and not strategy_active:
+            return super().dump(obj, many=many)
+        if unloaded is not None:
+            strategy = validate_strategy(unloaded)
+        else:
+            strategy = self.unloaded
+        with dump_context(strategy):
+            return super().dump(obj, many=many)
+
+    def _serialize(self, obj, *, many=False):
+        if current_strategy() is None:
+            # No loaded-only dump is in progress: marshmallow's default path.
+            return super()._serialize(obj, many=many)
+
+        if many and obj is not None:
+            result = []
+            for index, item in enumerate(obj):
+                with path_segment(index):
+                    result.append(self._serialize(item, many=False))
+            return result
+
+        ret = self.dict_class()
+        for attr_name, field_obj in self.dump_fields.items():
+            with path_segment(attr_name):
+                # Resolve the raw value ourselves so an unloaded attribute can
+                # be skipped without reaching the field's `_serialize` (which
+                # would try to iterate or format the OMITTED sentinel).
+                raw_value = field_obj.get_value(
+                    obj, attr_name, accessor=self.get_attribute
+                )
+                if raw_value is OMITTED:
+                    continue
+                if raw_value is missing:
+                    default = field_obj.dump_default
+                    raw_value = default() if callable(default) else default
+                    if raw_value is missing:
+                        continue
+                value = field_obj._serialize(raw_value, attr_name, obj)
+            if value is missing:
+                continue
+            key = field_obj.data_key if field_obj.data_key is not None else attr_name
+            ret[key] = value
+        return ret
+
+    def get_attribute(self, obj, attr, default):
+        if current_strategy() is None:
+            return super().get_attribute(obj, attr, default)
+        from marshmallow.utils import get_value
+
+        from .loaded_only import get_loaded_value
+
+        value = get_loaded_value(obj, attr)
+        # `missing` means the object is not a mapped ORM instance or the
+        # attribute is unmapped: fall back to marshmallow's standard lookup
+        # (mapping keys, callables, dotted attributes, ...).
+        if value is missing:
+            return get_value(obj, attr, default)
+        return value
 
 
 class SQLAlchemyAutoSchema(
