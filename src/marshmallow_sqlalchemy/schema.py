@@ -3,11 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 import sqlalchemy as sa
+from marshmallow import ValidationError, validates_schema
 from marshmallow.fields import Field
 from marshmallow.schema import Schema, SchemaMeta, SchemaOpts
 
 from .convert import ModelConverter
 from .exceptions import IncorrectSchemaTypeError
+from .fields import Composite, _CompositeValue
 from .load_instance_mixin import LoadInstanceMixin, _ModelType
 
 if TYPE_CHECKING:
@@ -121,13 +123,31 @@ class SQLAlchemySchemaMeta(SchemaMeta):
             mcs._maybe_filter_foreign_keys(inherited_fields, opts=opts, klass=klass),
             dict_cls,
         )
-        fields.update(mcs.get_declared_sqla_fields(fields, converter, opts, dict_cls))
-        fields.update(mcs.get_auto_fields(fields, converter, opts, dict_cls))
+        fields.update(
+            mcs.get_declared_sqla_fields(
+                cls_fields,
+                fields,
+                converter,
+                opts,
+                dict_cls,
+            )
+        )
+        fields.update(
+            mcs.get_auto_fields(
+                klass,
+                cls_fields,
+                fields,
+                converter,
+                opts,
+                dict_cls,
+            )
+        )
         return fields
 
     @classmethod
     def get_declared_sqla_fields(
         mcs,
+        cls_fields: list[tuple[str, Field]],
         base_fields: dict[str, Field],
         converter: ModelConverter,
         opts: Any,
@@ -138,21 +158,98 @@ class SQLAlchemySchemaMeta(SchemaMeta):
     @classmethod
     def get_auto_fields(
         mcs,
+        klass,
+        cls_fields: list[tuple[str, Field]],
         fields: dict[str, Field],
         converter: ModelConverter,
         opts: Any,
         dict_cls: type[dict],
     ) -> dict[str, Field]:
-        return dict_cls(
-            {
-                field_name: field.create_field(
-                    opts, field.column_name or field_name, converter
+        auto_fields = dict_cls()
+        declared_auto_component_attributes = {
+            field.column_name or field.field_kwargs.get("attribute") or name
+            for name, field in cls_fields
+            if isinstance(field, SQLAlchemyAutoField)
+        }
+        actual_composite_component_keys = {
+            declared_field.attribute or name
+            for name, declared_field in fields.items()
+            if not isinstance(declared_field, SQLAlchemyAutoField)
+            and declared_field is not None
+        }
+        if opts.model is not None:
+            composite_components = {
+                component.key: prop
+                for prop in sa.inspect(opts.model).attrs
+                if hasattr(prop, "composite_class")
+                for component in getattr(prop, "props", ())
+                if hasattr(component, "key")
+            }
+        else:
+            composite_components = {}
+
+        pending_composite_fields = []
+        for field_name, field in fields.items():
+            if (
+                not isinstance(field, SQLAlchemyAutoField)
+                or field_name in opts.exclude
+            ):
+                continue
+            column_name = field.column_name or field_name
+            owning_prop = composite_components.get(column_name)
+            if owning_prop is not None and owning_prop.key == column_name:
+                pending_composite_fields.append((field_name, field, column_name))
+            else:
+                auto_fields[field_name] = field.create_field(
+                    opts,
+                    column_name,
+                    converter,
                 )
-                for field_name, field in fields.items()
-                if isinstance(field, SQLAlchemyAutoField)
-                and field_name not in opts.exclude
+
+        actual_component_fields = {
+            generated_field.attribute or name
+            for name, generated_field in auto_fields.items()
+            if (generated_field.attribute or name) in composite_components
+        }.union(
+            {
+                name
+                for name in declared_auto_component_attributes
+                if name in composite_components
+            }
+        ).union(
+            {
+                declared_field.attribute or name
+                for name, declared_field in fields.items()
+                if (
+                    not isinstance(declared_field, SQLAlchemyAutoField)
+                    and declared_field is not None
+                    and (declared_field.attribute or name)
+                    in composite_components
+                )
             }
         )
+        for field_name, field, column_name in pending_composite_fields:
+            prop = composite_components[column_name]
+            prop_components = {
+                component.key
+                for component in prop.props
+                if hasattr(component, "key")
+            }
+            explicit_keys = prop_components.intersection(
+                declared_auto_component_attributes,
+                actual_component_fields,
+            )
+            include_keys = prop_components.intersection(
+                explicit_keys.union(actual_composite_component_keys),
+            )
+            auto_fields[field_name] = field.create_field(
+                opts,
+                column_name,
+                converter,
+                explicit_component_keys=explicit_keys,
+                include_component_keys=include_keys,
+            )
+        return auto_fields
 
     @staticmethod
     def _maybe_filter_foreign_keys(
@@ -197,9 +294,24 @@ class SQLAlchemySchemaMeta(SchemaMeta):
 class SQLAlchemyAutoSchemaMeta(SQLAlchemySchemaMeta):
     @classmethod
     def get_declared_sqla_fields(
-        cls, base_fields, converter: ModelConverter, opts, dict_cls
+        cls,
+        cls_fields,
+        base_fields,
+        converter: ModelConverter,
+        opts,
+        dict_cls,
     ):
         fields = dict_cls()
+        explicit_field_names = {
+            (
+                field.column_name
+                or field.field_kwargs.get("attribute")
+                or name
+            )
+            if isinstance(field, SQLAlchemyAutoField)
+            else name
+            for name, field in cls_fields
+        }
         if opts.table is not None:
             fields.update(
                 converter.fields_for_table(
@@ -220,6 +332,7 @@ class SQLAlchemyAutoSchemaMeta(SQLAlchemySchemaMeta):
                     include_fk=opts.include_fk,
                     include_relationships=opts.include_relationships,
                     base_fields=base_fields,
+                    explicit_field_names=explicit_field_names,
                     dict_cls=dict_cls,
                 )
             )
@@ -250,6 +363,190 @@ class SQLAlchemySchema(
 
     OPTIONS_CLASS = SQLAlchemySchemaOpts
 
+    @validates_schema(pass_original=True)
+    def _validate_composites(self, data, original, *, partial, **kwargs):
+        if not isinstance(data, dict) or not isinstance(original, dict):
+            return
+
+        errors = {}
+        for field_name, field in self.fields.items():
+            if not isinstance(field, Composite) or field.dump_only:
+                continue
+
+            data_key = field.data_key or field_name
+            attribute = field.attribute or field_name
+            component_fields = field.schema.fields
+            outer_field_by_attribute = {}
+            for outer_name, outer_field in self.fields.items():
+                if outer_field is field:
+                    continue
+                outer_attribute = outer_field.attribute or outer_name
+                if outer_attribute in component_fields:
+                    outer_field_by_attribute[outer_attribute] = (
+                        outer_name,
+                        outer_field,
+                    )
+            component_by_data_key = {}
+            for component_name, component_field in component_fields.items():
+                component_attribute = component_field.attribute or component_name
+                outer_name, outer_field = outer_field_by_attribute.get(
+                    component_attribute,
+                    (None, None),
+                )
+                if outer_field is not None and outer_field.data_key is not None:
+                    outer_data_key = outer_field.data_key
+                else:
+                    outer_data_key = outer_name or (
+                        component_field.data_key or component_name
+                    )
+                component_by_data_key[outer_data_key] = (
+                    component_name,
+                    component_field,
+                    component_attribute,
+                )
+            if attribute not in data and field.include_all_components:
+                component_values = _CompositeValue({}, field.constructor)
+                data[attribute] = component_values
+            elif data_key not in original or attribute not in data:
+                continue
+            else:
+                component_values = data[attribute]
+
+            if component_values is None:
+                for component_data_key, (
+                    _,
+                    _,
+                    component_attribute,
+                ) in component_by_data_key.items():
+                    if (
+                        component_data_key in original
+                        and data.get(component_attribute) is not None
+                    ):
+                        errors[data_key] = errors.get(data_key, [])
+                        errors.setdefault(component_data_key, []).append(
+                            "Conflicting value for composite component."
+                        )
+                continue
+
+            if not isinstance(component_values, _CompositeValue):
+                for component_data_key, (
+                    _,
+                    _,
+                    component_attribute,
+                ) in component_by_data_key.items():
+                    if (
+                        component_data_key in original
+                        and component_attribute in data
+                        and data[component_attribute]
+                        != getattr(component_values, component_attribute)
+                    ):
+                        errors[data_key] = errors.get(data_key, [])
+                        errors.setdefault(component_data_key, []).append(
+                            "Conflicting value for composite component."
+                        )
+                continue
+
+            for component_data_key, (
+                component_name,
+                _,
+                component_attribute,
+            ) in component_by_data_key.items():
+                if component_data_key not in original:
+                    continue
+                if component_name in component_values.provided_keys:
+                    if (
+                        component_attribute in data
+                        and component_values[component_attribute]
+                        != data[component_attribute]
+                    ):
+                        errors[data_key] = errors.get(data_key, [])
+                        errors.setdefault(component_data_key, []).append(
+                            "Conflicting value for composite component."
+                        )
+                    continue
+                if component_attribute in data:
+                    component_values[component_attribute] = data[
+                        component_attribute
+                    ]
+
+            if errors.get(data_key):
+                errors[data_key].append("Conflicting value for composite component.")
+                continue
+
+            missing_required = []
+            for component_name, component_field in component_fields.items():
+                component_attribute = component_field.attribute or component_name
+                if (
+                    component_attribute in component_values
+                    or self._is_partial_composite_component(
+                        partial, data_key, component_name
+                    )
+                ):
+                    continue
+                if (
+                    component_attribute
+                    in field.required_component_attributes
+                ):
+                    missing_required.append(component_name)
+
+            if missing_required:
+                nested_errors = errors.setdefault(data_key, {})
+                if not isinstance(nested_errors, dict):
+                    nested_errors = {}
+                    errors[data_key] = nested_errors
+                for component_name in missing_required:
+                    nested_errors.setdefault(component_name, []).append(
+                        "Missing data for required field."
+                    )
+                continue
+
+            if not component_values and partial is True:
+                continue
+
+            constructor_values = []
+            skipped_partial_components = False
+            for component_name, component_field in component_fields.items():
+                component_attribute = component_field.attribute or component_name
+                if component_attribute not in component_values:
+                    if self._is_partial_composite_component(
+                        partial, data_key, component_name
+                    ):
+                        skipped_partial_components = True
+                        continue
+                    component_values[component_attribute] = None
+                constructor_values.append(component_values[component_attribute])
+
+            if not constructor_values or skipped_partial_components:
+                continue
+
+            try:
+                data[attribute] = field.constructor(*constructor_values)
+            except (TypeError, ValueError) as error:
+                constructor_name = getattr(
+                    field.constructor, "__name__", "composite"
+                )
+                raise ValidationError(
+                    {
+                        data_key: {
+                            "_schema": [f"Not a valid {constructor_name} value."]
+                        }
+                    }
+                ) from error
+
+            for _, _, component_attribute in component_by_data_key.values():
+                data.pop(component_attribute, None)
+
+        if errors:
+            raise ValidationError(errors)
+
+    @staticmethod
+    def _is_partial_composite_component(partial, composite_key, component_key):
+        if partial is True:
+            return True
+        if not partial:
+            return False
+        component_path = f"{composite_key}.{component_key}"
+        return composite_key in partial or component_path in partial
 
 class SQLAlchemyAutoSchema(
     SQLAlchemySchema[_ModelType], metaclass=SQLAlchemyAutoSchemaMeta

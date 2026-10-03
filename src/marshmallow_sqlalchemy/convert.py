@@ -22,10 +22,11 @@ import marshmallow as ma
 import sqlalchemy as sa
 from marshmallow import fields, validate
 from sqlalchemy.dialects import mssql, mysql, postgresql
+from sqlalchemy.orm import CompositeProperty
 from sqlalchemy.orm import SynonymProperty
 
 from .exceptions import ModelConversionError
-from .fields import Related, RelatedList
+from .fields import Composite, Related, RelatedList
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -40,6 +41,10 @@ _FieldPartial: TypeAlias = Callable[[], fields.Field]
 # TODO: Use more specific type for second argument
 _FieldClassFactory: TypeAlias = Callable[
     ["ModelConverter", Any], type[fields.Field] | _FieldPartial
+]
+_CompositeFieldFactory: TypeAlias = Callable[
+    ["ModelConverter", CompositeProperty, dict[str, fields.Field], dict[str, Any]],
+    fields.Field,
 ]
 
 
@@ -127,6 +132,7 @@ class ModelConverter:
         mssql.BIT: fields.Integer,
         mssql.UNIQUEIDENTIFIER: fields.UUID,
     }
+    COMPOSITE_TYPE_MAPPING: dict[Any, type[fields.Field] | _CompositeFieldFactory] = {}
     DIRECTION_MAPPING = {"MANYTOONE": False, "MANYTOMANY": True, "ONETOMANY": True}
 
     def __init__(self, schema_cls: type[ma.Schema] | None = None):
@@ -147,6 +153,7 @@ class ModelConverter:
         fields: Iterable[str] | None = None,
         exclude: Iterable[str] | None = None,
         base_fields: dict | None = None,
+        explicit_field_names: Iterable[str] | None = None,
         dict_cls: type[dict] = dict,
     ) -> dict[str, fields.Field]:
         """Generate a dict of field_name: `marshmallow.fields.Field` pairs for the given model.
@@ -159,16 +166,66 @@ class ModelConverter:
         """
         result = dict_cls()
         base_fields = base_fields or {}
+        explicit_field_names = set(explicit_field_names or ())
+        attrs = list(sa.inspect(model).attrs)  # type: ignore[union-attr]
+        composite_properties = [
+            prop
+            for prop in attrs
+            if isinstance(prop, CompositeProperty)
+            and not self._should_exclude_field(prop, fields=fields, exclude=exclude)
+        ]
+        composite_components = {
+            component.key
+            for prop in composite_properties
+            for component in self._composite_column_properties(prop)
+        }
+        explicit_composite_components = set(explicit_field_names).intersection(
+            composite_components
+        )
+        suppressed_composite_components = (
+            composite_components - explicit_composite_components
+        )
+        retained_composite_components = set()
+        for prop in composite_properties:
+            prop_components = {
+                component.key
+                for component in self._composite_column_properties(prop)
+            }
+            if not explicit_composite_components.intersection(
+                prop_components
+            ):
+                continue
+            for component in self._composite_column_properties(prop):
+                column = _base_column(component.columns[0])
+                if not column.nullable and not _has_default(column):
+                    suppressed_composite_components.discard(component.key)
+                    retained_composite_components.add(component.key)
 
-        for prop in sa.inspect(model).attrs:  # type: ignore[union-attr]
+        for prop in attrs:
             key = self._get_field_name(prop)
+            field = None
             if self._should_exclude_field(prop, fields=fields, exclude=exclude):
                 # Allow marshmallow to validate and exclude the field key.
                 result[key] = None
                 continue
             if isinstance(prop, SynonymProperty):
                 continue
+            if (
+                isinstance(prop, CompositeProperty)
+                and key in base_fields
+                and not hasattr(base_fields[key], "create_field")
+            ):
+                result[key] = base_fields[key]
+                continue
             if hasattr(prop, "columns"):
+                if (
+                    key in suppressed_composite_components
+                    and not (
+                        key in base_fields
+                        and hasattr(base_fields[key], "create_field")
+                    )
+                ):
+                    continue
                 if not include_fk:
                     # Only skip a column if there is no overriden column
                     # which does not have a Foreign Key.
@@ -179,7 +236,59 @@ class ModelConverter:
                         continue
             if not include_relationships and hasattr(prop, "direction"):
                 continue
-            field = base_fields.get(key) or self.property2field(prop)
+            if isinstance(prop, CompositeProperty):
+                prop_components = {
+                    component.key
+                    for component in self._composite_column_properties(prop)
+                }
+                explicit_keys = explicit_composite_components.intersection(
+                    prop_components
+                )
+                include_keys = explicit_composite_components.union(
+                    retained_composite_components
+                ).intersection(prop_components)
+                base_field = base_fields.get(key)
+                if base_field is not None and not hasattr(
+                    base_field,
+                    "create_field",
+                ):
+                    field = base_field
+                elif (
+                    isinstance(base_field, type)
+                    and issubclass(base_field, fields.Field)
+                ):
+                    field = base_field()
+                elif hasattr(base_field, "create_field"):
+                    field = self.property2field(
+                        prop,
+                        explicit_component_keys=explicit_keys,
+                        include_component_keys=include_keys,
+                        **base_field.field_kwargs,
+                    )
+                else:
+                    field = self.property2field(
+                        prop,
+                        explicit_component_keys=explicit_keys,
+                        include_component_keys=include_keys,
+                    )
+            elif key in explicit_composite_components:
+                base_field = base_fields.get(key)
+                if base_field is not None and hasattr(
+                    base_field,
+                    "create_field",
+                ):
+                    continue
+                if base_field is not None and not hasattr(
+                    base_field,
+                    "create_field",
+                ):
+                    field = base_field
+                else:
+                    field = self.property2field(prop, required=False)
+            elif key in retained_composite_components:
+                field = self.property2field(prop, required=False)
+            else:
+                field = base_fields.get(key) or self.property2field(prop)
             if field:
                 result[key] = field
         return result
@@ -237,6 +346,8 @@ class ModelConverter:
         *,
         instance: bool = True,
         field_class: type[fields.Field] | None = None,
+        explicit_component_keys: frozenset[str] | set[str] | None = None,
+        include_component_keys: frozenset[str] | set[str] | None = None,
         **kwargs,
     ) -> fields.Field | type[fields.Field]:
         """Convert a SQLAlchemy `Property` to a field instance or class.
@@ -256,6 +367,14 @@ class ModelConverter:
         field_class = field_class or self._get_field_class_for_property(prop)
         if not instance:
             return field_class
+        if isinstance(prop, CompositeProperty):
+            return self.composite2field(
+                prop,
+                field_class=field_class,
+                explicit_component_keys=explicit_component_keys,
+                include_component_keys=include_component_keys,
+                **kwargs,
+            )
         field_kwargs = self._get_field_kwargs_for_property(prop)
         field_kwargs.update(kwargs)
         ret = field_class(**field_kwargs)
@@ -397,12 +516,126 @@ class ModelConverter:
 
     def _get_field_class_for_property(self, prop) -> type[fields.Field]:
         field_cls: type[fields.Field]
+        if isinstance(prop, CompositeProperty):
+            return Composite
         if hasattr(prop, "direction"):
             field_cls = Related
         else:
             column = _base_column(prop.columns[0])
             field_cls = self._get_field_class_for_column(column)
         return field_cls
+
+    def composite2field(
+        self,
+        prop: CompositeProperty,
+        *,
+        field_class: type[fields.Field] | None = None,
+        explicit_component_keys: frozenset[str] | set[str] | None = None,
+        include_component_keys: frozenset[str] | set[str] | None = None,
+        **kwargs,
+    ) -> fields.Field:
+        explicit_component_keys = explicit_component_keys or frozenset()
+        include_component_keys = include_component_keys or explicit_component_keys
+        column_properties = self._composite_column_properties(prop)
+        component_fields = {
+            component.key: self.property2field(
+                component,
+                required=False,
+            )
+            for component in column_properties
+        }
+        required_components = tuple(
+            component_field_name
+            for component_field_name, component in zip(
+                component_fields.keys(),
+                column_properties,
+            )
+            if not _base_column(component.columns[0]).nullable
+            and not _has_default(_base_column(component.columns[0]))
+        )
+        required_component_attributes = tuple(
+            component_fields[component_name].attribute or component_name
+            for component_name in required_components
+        )
+        field_kwargs = self._get_field_kwargs_for_composite(
+            prop,
+            component_fields,
+            explicit_component_keys=explicit_component_keys,
+        )
+        field_kwargs.update(kwargs)
+
+        registered_field = self._get_registered_composite_field(prop.composite_class)
+        if _is_field(registered_field):
+            if issubclass(registered_field, Composite):
+                return registered_field(
+                    component_fields,
+                    prop.composite_class,
+                    required_components=required_components,
+                    required_component_attributes=required_component_attributes,
+                    include_all_components=bool(include_component_keys),
+                    **field_kwargs,
+                )
+            return registered_field(**field_kwargs)
+        if registered_field is not None:
+            factory = cast("_CompositeFieldFactory", registered_field)
+            try:
+                parameter_count = len(
+                    inspect.signature(factory).parameters
+                )
+            except (TypeError, ValueError):
+                parameter_count = 4
+            if parameter_count == 3:
+                return factory(prop, component_fields, field_kwargs)
+            return factory(self, prop, component_fields, field_kwargs)
+
+        return (field_class or Composite)(
+            component_fields,
+            prop.composite_class,
+            required_components=required_components,
+            required_component_attributes=required_component_attributes,
+            include_all_components=bool(include_component_keys),
+            **field_kwargs,
+        )
+
+    def _get_registered_composite_field(self, composite_class: Any) -> Any:
+        for composite_type in inspect.getmro(composite_class):
+            if composite_type in self.COMPOSITE_TYPE_MAPPING:
+                return self.COMPOSITE_TYPE_MAPPING[composite_type]
+        return None
+
+    def _composite_column_properties(self, prop: CompositeProperty):
+        return [
+            component
+            for component in prop.props
+            if hasattr(component, "columns")
+        ]
+
+    def _get_field_kwargs_for_composite(
+        self,
+        prop: CompositeProperty,
+        component_fields: dict[str, fields.Field],
+        *,
+        explicit_component_keys: frozenset[str] | set[str] | None = None,
+    ) -> dict[str, Any]:
+        kwargs = self.get_base_kwargs()
+        component_columns = [
+            _base_column(component.columns[0])
+            for component in self._composite_column_properties(prop)
+        ]
+        kwargs["allow_none"] = all(column.nullable for column in component_columns)
+        required = any(
+            not column.nullable and not _has_default(column)
+            for column in component_columns
+        )
+        kwargs["required"] = (
+            not explicit_component_keys and required
+        )
+        kwargs["dump_only"] = any(
+            component_field.dump_only for component_field in component_fields.values()
+        ) or len(component_fields) != len(prop.props)
+        if getattr(prop, "doc", None):
+            kwargs["metadata"]["description"] = prop.doc
+        return kwargs
 
     def _get_field_kwargs_for_property(self, prop: PropertyOrColumn) -> dict[str, Any]:
         kwargs = self.get_base_kwargs()

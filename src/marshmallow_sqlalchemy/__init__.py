@@ -13,6 +13,7 @@ from .schema import (
     SQLAlchemySchemaOpts,
     auto_field,
 )
+from .fields import Composite
 
 __all__ = [
     "ModelConversionError",
@@ -22,6 +23,7 @@ __all__ = [
     "SQLAlchemySchema",
     "SQLAlchemySchemaOpts",
     "auto_field",
+    "Composite",
     "column2field",
     "field_for",
     "fields_for_model",

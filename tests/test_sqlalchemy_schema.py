@@ -8,7 +8,13 @@ import sqlalchemy as sa
 from marshmallow import Schema, ValidationError, fields, validate
 from pytest_lazy_fixtures import lf
 
-from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, SQLAlchemySchema, auto_field
+from marshmallow_sqlalchemy import (
+    ModelConverter,
+    SQLAlchemyAutoSchema,
+    SQLAlchemySchema,
+    auto_field,
+)
+from tests.conftest import Coordinate
 from marshmallow_sqlalchemy.exceptions import IncorrectSchemaTypeError
 from marshmallow_sqlalchemy.fields import Related
 
@@ -750,3 +756,170 @@ def test_dumping_pickle_field(models, teacher):
     assert schema.dump(teacher) == {
         "data": {"foo": "bar"},
     }
+
+
+class TestComposite:
+    @pytest.fixture
+    def place_schema(self, models):
+        class PlaceSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+
+        return PlaceSchema()
+
+    def test_auto_schema_uses_nested_composite_field(self, models, place_schema):
+        from marshmallow_sqlalchemy.fields import Composite
+
+        assert isinstance(place_schema.fields["coordinate"], Composite)
+        assert "latitude" not in place_schema.fields
+        assert "longitude" not in place_schema.fields
+        assert place_schema.fields["coordinate"].allow_none is True
+
+    def test_composite_sqlite_roundtrip(self, models, session, place_schema):
+        place = models.Place(coordinate=Coordinate(12.5, 34.25))
+        session.add(place)
+        session.commit()
+
+        loaded = session.get(models.Place, place.id)
+        assert place_schema.dump(loaded) == {
+            "id": 1,
+            "coordinate": {"latitude": 12.5, "longitude": 34.25},
+        }
+
+        loaded_data = place_schema.load(
+            {"coordinate": {"latitude": 1.0, "longitude": 2.0}}
+        )
+        assert loaded_data == {"coordinate": Coordinate(1.0, 2.0)}
+
+    def test_composite_instance_sqlite_roundtrip(self, models, session):
+        class PlaceSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+                load_instance = True
+                sqla_session = session
+
+        schema = PlaceSchema()
+        place = schema.load({"coordinate": {"latitude": 1.0, "longitude": 2.0}})
+        session.add(place)
+        session.commit()
+
+        loaded = session.get(models.Place, place.id)
+        assert loaded.coordinate == Coordinate(1.0, 2.0)
+        assert schema.dump(loaded)["coordinate"] == {
+            "latitude": 1.0,
+            "longitude": 2.0,
+        }
+
+    def test_composite_handles_null_and_partial_values(self, models, place_schema):
+        assert place_schema.load({"coordinate": None}) == {"coordinate": None}
+        assert place_schema.load({"coordinate": {}}) == {
+            "coordinate": Coordinate(None, None)
+        }
+        assert place_schema.load({"coordinate": {"latitude": 1.0}}) == {
+            "coordinate": Coordinate(1.0, None)
+        }
+
+    def test_invalid_component_error_location_leaves_instance_unchanged(
+        self,
+        models,
+        session,
+        place_schema,
+    ):
+        place = models.Place(id=7, coordinate=Coordinate(12.5, 34.25))
+        session.add(place)
+        session.flush()
+
+        with pytest.raises(ValidationError) as exc_info:
+            place_schema.load(
+                {"coordinate": {"latitude": "invalid", "longitude": 5.0}},
+                instance=place,
+            )
+
+        assert exc_info.value.messages == {
+            "coordinate": {"latitude": ["Not a valid number."]}
+        }
+        assert (place.latitude, place.longitude) == (12.5, 34.25)
+        assert place.coordinate == Coordinate(12.5, 34.25)
+
+    def test_constructor_validation_cannot_be_bypassed(self, models, place_schema):
+        with pytest.raises(ValidationError) as exc_info:
+            place_schema.load({"coordinate": {"latitude": 1.0, "longitude": 200.0}})
+
+        assert "coordinate" in exc_info.value.messages
+
+    def test_explicit_component_is_merged_into_composite(self, models):
+        class PlaceSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+
+            latitude = auto_field()
+
+        schema = PlaceSchema()
+        loaded = schema.load(
+            {"latitude": 12.5, "coordinate": {"longitude": 34.25}}
+        )
+
+        assert loaded == {"coordinate": Coordinate(12.5, 34.25)}
+
+    def test_conflicting_explicit_component_reports_both_sources(self, models):
+        class PlaceSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+
+            latitude = auto_field()
+
+        schema = PlaceSchema()
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(
+                {"latitude": 12.5, "coordinate": {"latitude": 13.0}}
+            )
+
+        assert exc_info.value.messages["latitude"]
+        assert "coordinate" in exc_info.value.messages
+
+    def test_read_only_composite(self, models):
+        class PlaceSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+
+            coordinate = auto_field(dump_only=True)
+
+        schema = PlaceSchema()
+        assert schema.fields["coordinate"].dump_only is True
+        assert schema.load({}) == {}
+
+    def test_inherited_schema_configuration_does_not_change_parent_fields(self, models):
+        class ParentSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+
+            coordinate = auto_field()
+            latitude = auto_field()
+
+        class ChildSchema(ParentSchema):
+            longitude = auto_field()
+
+        parent_schema = ParentSchema()
+        child_schema = ChildSchema()
+
+        assert "longitude" not in parent_schema.fields
+        assert "longitude" in child_schema.fields
+        assert "latitude" in parent_schema.fields
+        assert "latitude" in child_schema.fields
+
+    def test_custom_composite_field_rule(self, models):
+        from marshmallow_sqlalchemy.fields import Composite
+
+        class CoordinateField(Composite):
+            pass
+
+        class PlaceConverter(ModelConverter):
+            COMPOSITE_TYPE_MAPPING = {Coordinate: CoordinateField}
+
+        class PlaceSchema(SQLAlchemyAutoSchema[models.Place]):
+            class Meta:
+                model = models.Place
+                model_converter = PlaceConverter
+
+        schema = PlaceSchema()
+        assert isinstance(schema.fields["coordinate"], CoordinateField)

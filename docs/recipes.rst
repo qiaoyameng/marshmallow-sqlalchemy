@@ -231,6 +231,61 @@ If a field's external data key differs from the model's column name, you can pas
         # Generate "created_date" field from "date_created" column
         created_date = auto_field("date_created", dump_only=True)
 
+Composite column types
+======================
+
+SQLAlchemy :func:`~sqlalchemy.orm.composite` properties are generated as nested fields.
+Loading the field constructs the registered composite value type with its mapped
+components, so constructors can validate the combined value.
+
+.. code-block:: python
+
+    from dataclasses import dataclass
+
+    import sqlalchemy as sa
+    from sqlalchemy.orm import DeclarativeBase, Mapped, composite, mapped_column
+
+    from marshmallow_sqlalchemy import SQLAlchemyAutoSchema
+
+
+    @dataclass(frozen=True)
+    class Point:
+        x: int
+        y: int
+
+
+    class Base(DeclarativeBase):
+        pass
+
+
+    class Place(Base):
+        __tablename__ = "place"
+
+        id: Mapped[int] = mapped_column(primary_key=True)
+        x: Mapped[int | None] = mapped_column(nullable=True)
+        y: Mapped[int | None] = mapped_column(nullable=True)
+        point: Mapped[Point] = composite(Point, x, y)
+
+
+    class PlaceSchema(SQLAlchemyAutoSchema):
+        class Meta:
+            model = Place
+
+Custom fields can be registered for a value type on the converter.
+
+.. code-block:: python
+
+    from marshmallow_sqlalchemy import ModelConverter
+    from marshmallow_sqlalchemy.fields import Composite
+
+
+    class PointField(Composite):
+        pass
+
+
+    class PlaceConverter(ModelConverter):
+        COMPOSITE_TYPE_MAPPING = {Point: PointField}
+
 Automatically generating schemas for SQLAlchemy models
 ======================================================
 

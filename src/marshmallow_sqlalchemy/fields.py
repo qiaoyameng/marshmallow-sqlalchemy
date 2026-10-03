@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from marshmallow import fields
@@ -11,6 +12,60 @@ from sqlalchemy.orm.exc import NoResultFound
 if TYPE_CHECKING:
     from sqlalchemy.ext.declarative import DeclarativeMeta
     from sqlalchemy.orm import MapperProperty
+
+
+class _CompositeValue(dict):
+    def __init__(self, value, constructor, *, provided_keys=None):
+        super().__init__(value)
+        self.constructor = constructor
+        self.provided_keys = set(provided_keys or value.keys())
+
+
+class Composite(fields.Nested):
+    """A nested field representing a SQLAlchemy composite value type."""
+
+    default_error_messages = {
+        "invalid_type": "Not a valid composite value.",
+        "invalid": "Not a valid {name} value.",
+    }
+
+    def __init__(
+        self,
+        nested: dict[str, fields.Field],
+        constructor: Any,
+        *,
+        required_components: tuple[str, ...] = (),
+        required_component_attributes: tuple[str, ...] = (),
+        include_all_components: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(nested, **kwargs)
+        self.constructor = constructor
+        self.required_components = required_components
+        self.required_component_attributes = required_component_attributes
+        self.include_all_components = include_all_components
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        return {
+            component_field.data_key or component_field.name: getattr(
+                value,
+                component_field.attribute or component_field.name,
+            )
+            for component_field in self.schema.fields.values()
+        }
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        if not isinstance(value, Mapping):
+            raise self.make_error("invalid_type")
+
+        component_values = super()._deserialize(value, attr, data, **kwargs)
+        return _CompositeValue(
+            component_values,
+            self.constructor,
+            provided_keys=value.keys(),
+        )
 
 
 class RelatedList(fields.List):

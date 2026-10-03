@@ -13,6 +13,7 @@ from sqlalchemy.orm import (
     Mapped,
     backref,
     column_property,
+    composite,
     declarative_base,
     relationship,
     sessionmaker,
@@ -59,6 +60,16 @@ def session(Base, models, engine):
 CourseLevel = Enum("CourseLevel", "PRIMARY SECONDARY")
 
 
+@dataclass(frozen=True)
+class Coordinate:
+    latitude: float | None
+    longitude: float | None
+
+    def __post_init__(self):
+        if self.longitude is not None and not -180 <= self.longitude <= 180:
+            raise ValueError("longitude must be between -180 and 180")
+
+
 @dataclass
 class Models:
     Course: type[DeclarativeMeta]
@@ -71,6 +82,7 @@ class Models:
     Seminar: type[DeclarativeMeta]
     Lecture: type[DeclarativeMeta]
     Keyword: type[DeclarativeMeta]
+    Place: type[DeclarativeMeta]
 
 
 @pytest.fixture
@@ -213,6 +225,14 @@ def models(Base: type) -> Models:
         id = sa.Column(sa.Integer, primary_key=True)
         keyword = sa.Column(sa.String)
 
+    class Place(Base):
+        __tablename__ = "place"
+
+        id = sa.Column(sa.Integer, primary_key=True)
+        latitude = sa.Column(sa.Float, nullable=True)
+        longitude = sa.Column(sa.Float, nullable=True)
+        coordinate = composite(Coordinate, latitude, longitude)
+
     class Lecture(Base):
         __tablename__ = "lecture"
         __table_args__ = (
@@ -245,4 +265,5 @@ def models(Base: type) -> Models:
         Seminar=Seminar,
         Lecture=Lecture,
         Keyword=Keyword,
+        Place=Place,
     )

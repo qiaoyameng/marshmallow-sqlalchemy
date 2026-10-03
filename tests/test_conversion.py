@@ -18,9 +18,9 @@ from marshmallow_sqlalchemy import (
     fields_for_model,
     property2field,
 )
-from marshmallow_sqlalchemy.fields import Related, RelatedList
+from marshmallow_sqlalchemy.fields import Composite, Related, RelatedList
 
-from .conftest import CourseLevel, mapped_column
+from .conftest import Coordinate, CourseLevel, mapped_column
 
 
 def contains_validator(field, v_type):
@@ -31,6 +31,18 @@ def contains_validator(field, v_type):
 
 
 class TestModelFieldConversion:
+    def test_fields_for_model_converts_composite(self, models):
+        generated = fields_for_model(models.Place)
+        assert isinstance(generated["coordinate"], Composite)
+        assert "latitude" not in generated
+        assert "longitude" not in generated
+
+        class PlaceConverter(ModelConverter):
+            COMPOSITE_TYPE_MAPPING = {Coordinate: Composite}
+
+        generated = PlaceConverter().fields_for_model(models.Place)
+        assert isinstance(generated["coordinate"], Composite)
+
     def test_fields_for_model_types(self, models):
         fields_ = fields_for_model(models.Student, include_fk=True)
         assert type(fields_["id"]) is fields.Int
