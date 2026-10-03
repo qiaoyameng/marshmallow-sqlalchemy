@@ -3,11 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 import sqlalchemy as sa
+from marshmallow import ValidationError, validates_schema
 from marshmallow.fields import Field
 from marshmallow.schema import Schema, SchemaMeta, SchemaOpts
 
 from .convert import ModelConverter
 from .exceptions import IncorrectSchemaTypeError
+from .fields import Composite
 from .load_instance_mixin import LoadInstanceMixin, _ModelType
 
 if TYPE_CHECKING:
@@ -249,6 +251,77 @@ class SQLAlchemySchema(
     """
 
     OPTIONS_CLASS = SQLAlchemySchemaOpts
+
+    @validates_schema(pass_original=True)
+    def validate_composite_column_conflicts(self, data, original_data, **kwargs):
+        if not isinstance(original_data, dict):
+            return
+        load_fields_by_attribute = {
+            field.attribute or field_name: field
+            for field_name, field in self.load_fields.items()
+        }
+        composite_values_by_component: dict[str, tuple[str, Any]] = {}
+
+        for field_name, field in self.load_fields.items():
+            if not isinstance(field, Composite):
+                continue
+
+            attribute_name = field.attribute or field_name
+            if attribute_name not in data:
+                continue
+
+            composite_value = data[attribute_name]
+            if composite_value is None:
+                component_values = [None] * len(field.component_keys)
+            else:
+                component_values = field.get_component_values(composite_value)
+                if len(component_values) != len(field.component_keys):
+                    continue
+
+            for component_key, component_value in zip(
+                field.component_keys, component_values
+            ):
+                previous = composite_values_by_component.get(component_key)
+                if previous is not None and previous[1] != component_value:
+                    previous_field_name, _ = previous
+                    message = f"Conflicting values for '{component_key}'."
+                    raise ValidationError(
+                        {
+                            previous_field_name: [message],
+                            field_name: [message],
+                        }
+                    )
+                composite_values_by_component[component_key] = (
+                    field_name,
+                    component_value,
+                )
+
+                component_field = load_fields_by_attribute.get(component_key)
+                if component_field is None:
+                    continue
+                component_field_name = (
+                    component_field.name or component_key
+                )
+
+                original_key = (
+                    component_field.data_key
+                    if component_field.data_key is not None
+                    else component_key
+                )
+                if (
+                    original_key in original_data
+                    and component_key in data
+                    and data[component_key] != component_value
+                ):
+                    message = (
+                        f"Conflicting values for '{component_key}'."
+                    )
+                    raise ValidationError(
+                        {
+                            field_name: [message],
+                            component_field_name: [message],
+                        }
+                    )
 
 
 class SQLAlchemyAutoSchema(

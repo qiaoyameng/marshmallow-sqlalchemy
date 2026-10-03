@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from marshmallow import fields
+from marshmallow import ValidationError, fields
 from marshmallow.utils import is_iterable_but_not_string
 from sqlalchemy import inspect
 from sqlalchemy.orm.exc import NoResultFound
@@ -148,6 +149,86 @@ class Nested(fields.Nested):
             self.schema.session = self.root.session
             self.schema.transient = self.root.transient
         return super()._deserialize(*args, **kwargs)
+
+
+class Composite(Nested):
+    """Field for a SQLAlchemy composite property."""
+
+    def __init__(
+        self,
+        nested,
+        composite_class,
+        component_keys: Iterable[str],
+        *,
+        construct=None,
+        value_getter: Callable[[Any], Iterable[Any]] | None = None,
+        **kwargs,
+    ):
+        super().__init__(nested, **kwargs)
+        self.composite_class = composite_class
+        self.component_keys = tuple(component_keys)
+        self.construct = construct or composite_class
+        self.value_getter = value_getter
+
+    def _load(
+        self,
+        value,
+        partial: bool | str | list | tuple | set | None = None,
+    ):
+        if value is None:
+            return None
+
+        if partial is not False:
+            if isinstance(value, Mapping):
+                current = getattr(self.root, "instance", None)
+                if current is not None:
+                    current = getattr(current, self.attribute or self.name, None)
+
+                values = {}
+                for key in self.component_keys:
+                    field = self.schema.fields.get(key)
+                    if field is None:
+                        continue
+                    data_key = field.data_key or key
+                    if data_key in value:
+                        values[data_key] = value[data_key]
+                    elif current is not None:
+                        values[data_key] = self._get_component_value(current, key)
+
+                value = values
+            partial = False
+
+        try:
+            data = super()._load(value, partial=partial)
+            values = []
+            for key in self.component_keys:
+                field = self.schema.fields.get(key)
+                data_key = field.attribute or key if field else key
+                values.append(data.get(data_key))
+            return self.construct(*values)
+        except ValidationError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise ValidationError(str(error), field_name="_schema") from error
+
+    def get_component_values(self, value):
+        if self.value_getter is not None:
+            try:
+                values = tuple(self.value_getter(value))
+            except AttributeError:
+                values = ()
+            if len(values) == len(self.component_keys):
+                return values
+        try:
+            return tuple(value.__composite_values__())
+        except AttributeError:
+            return tuple(getattr(value, key) for key in self.component_keys)
+
+    def _get_component_value(self, value, key):
+        values = self.get_component_values(value)
+        if len(values) == len(self.component_keys):
+            return values[self.component_keys.index(key)]
+        return getattr(value, key)
 
 
 def get_primary_keys(model: type[DeclarativeMeta]) -> list[MapperProperty]:

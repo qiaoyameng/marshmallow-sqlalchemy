@@ -4,6 +4,11 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add nested conversion for SQLAlchemy composite properties. Composite value types
+  can register field construction rules through ``ModelConverter.COMPOSITE_TYPE_MAPPING``.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.

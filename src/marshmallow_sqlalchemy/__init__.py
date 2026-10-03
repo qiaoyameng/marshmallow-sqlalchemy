@@ -6,6 +6,7 @@ from .convert import (
     property2field,
 )
 from .exceptions import ModelConversionError
+from .fields import Composite
 from .schema import (
     SQLAlchemyAutoSchema,
     SQLAlchemyAutoSchemaOpts,
@@ -23,6 +24,7 @@ __all__ = [
     "SQLAlchemySchemaOpts",
     "auto_field",
     "column2field",
+    "Composite",
     "field_for",
     "fields_for_model",
     "property2field",

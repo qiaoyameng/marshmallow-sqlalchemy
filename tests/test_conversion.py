@@ -1,6 +1,8 @@
 import datetime as dt
 import decimal
+import functools
 import uuid
+from dataclasses import dataclass
 from typing import cast
 
 import pytest
@@ -8,7 +10,7 @@ import sqlalchemy as sa
 from marshmallow import Schema, fields, validate
 from sqlalchemy import Integer, String
 from sqlalchemy.dialects import mysql, postgresql
-from sqlalchemy.orm import Mapped, Session, column_property
+from sqlalchemy.orm import Mapped, Session, column_property, composite
 
 from marshmallow_sqlalchemy import (
     ModelConversionError,
@@ -151,6 +153,125 @@ class TestModelFieldConversion:
 
         fields_ = fields_for_model(FirstGradeStudent)
         assert fields_["dob"].allow_none is True
+
+    def test_fields_for_model_composite(self, Base: type):
+        @dataclass(frozen=True)
+        class Point:
+            x: int
+            y: int
+
+        class Place(Base):
+            __tablename__ = "place"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            x = sa.Column(sa.Integer, nullable=False)
+            y = sa.Column(sa.Integer, nullable=False)
+            position = composite(Point, x, y)
+
+        fields_ = fields_for_model(Place)
+
+        assert "position" in fields_
+        assert "x" not in fields_
+        assert "y" not in fields_
+        assert fields_["position"].required is True
+        assert fields_["position"].schema.fields["x"].required is True
+
+    def test_fields_for_model_explicit_composite_component(self, Base: type):
+        @dataclass(frozen=True)
+        class Point:
+            x: int
+            y: int
+
+        class Place(Base):
+            __tablename__ = "place"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            x = sa.Column(sa.Integer, nullable=False)
+            y = sa.Column(sa.Integer, nullable=False)
+            position = composite(Point, x, y)
+
+        fields_ = fields_for_model(
+            Place, base_fields={"x": fields.Integer(required=True)}
+        )
+
+        assert "position" in fields_
+        assert "x" in fields_
+
+    def test_composite_type_mapping_field_factories(self, Base: type):
+        @dataclass(frozen=True)
+        class FactoryPoint:
+            x: int
+            y: int
+
+        class PointPlace(Base):
+            __tablename__ = "point_place"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            x = sa.Column(sa.Integer, nullable=False)
+            y = sa.Column(sa.Integer, nullable=False)
+            position = composite(FactoryPoint, x, y)
+
+        @dataclass(frozen=True)
+        class NamedPoint:
+            horizontal: int
+            vertical: int
+
+        class NamedPlace(Base):
+            __tablename__ = "named_place"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            horizontal = sa.Column(sa.Integer, nullable=False)
+            vertical = sa.Column(sa.Integer, nullable=False)
+            position = composite(NamedPoint, horizontal, vertical)
+
+        class PointFactoryConverter(ModelConverter):
+            COMPOSITE_TYPE_MAPPING = ModelConverter.COMPOSITE_TYPE_MAPPING | {
+                FactoryPoint: functools.partial(fields.Int)
+            }
+
+        class FactoryConverter(ModelConverter):
+            COMPOSITE_TYPE_MAPPING = ModelConverter.COMPOSITE_TYPE_MAPPING | {
+                NamedPoint: lambda converter, prop: {
+                    "horizontal": fields.Int(),
+                    "vertical": fields.Int(),
+                }
+            }
+
+        point_fields = PointFactoryConverter().fields_for_model(PointPlace)
+        factory_fields = FactoryConverter().fields_for_model(NamedPlace)
+
+        assert isinstance(point_fields["position"].schema.fields["x"], fields.Integer)
+        assert isinstance(
+            factory_fields["position"].schema.fields["horizontal"],
+            fields.Integer,
+        )
+
+    def test_composite_type_mapping_schema(self, Base: type):
+        @dataclass(frozen=True)
+        class SchemaPoint:
+            x: int | None
+            y: int | None
+
+        class SchemaPointPlace(Base):
+            __tablename__ = "schema_point_place"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            x = sa.Column(sa.Integer, nullable=True)
+            y = sa.Column(sa.Integer, nullable=True)
+            position = composite(SchemaPoint, x, y)
+
+        class SchemaPointSchema(Schema):
+            x = fields.Int(allow_none=True)
+            y = fields.Int(allow_none=True)
+
+        class SchemaConverter(ModelConverter):
+            COMPOSITE_TYPE_MAPPING = ModelConverter.COMPOSITE_TYPE_MAPPING | {
+                SchemaPoint: SchemaPointSchema
+            }
+
+        converted = SchemaConverter().fields_for_model(SchemaPointPlace)
+
+        assert isinstance(converted["position"].schema, SchemaPointSchema)
 
 
 def make_property(*column_args, **column_kwargs):

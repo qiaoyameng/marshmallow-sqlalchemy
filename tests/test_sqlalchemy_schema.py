@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib.metadata import version
 
 import marshmallow
@@ -7,8 +8,15 @@ import pytest
 import sqlalchemy as sa
 from marshmallow import Schema, ValidationError, fields, validate
 from pytest_lazy_fixtures import lf
+from sqlalchemy.orm import composite
 
-from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, SQLAlchemySchema, auto_field
+from marshmallow_sqlalchemy import (
+    ModelConverter,
+    SQLAlchemyAutoSchema,
+    SQLAlchemySchema,
+    auto_field,
+)
+from marshmallow_sqlalchemy.fields import Composite
 from marshmallow_sqlalchemy.exceptions import IncorrectSchemaTypeError
 from marshmallow_sqlalchemy.fields import Related
 
@@ -41,6 +49,21 @@ def school(models, session):
 
 class EntityMixin:
     id = auto_field(dump_only=True)
+
+
+@dataclass(frozen=True)
+class Point:
+    x: int | None
+    y: int | None
+
+
+class PointConverter(ModelConverter):
+    COMPOSITE_TYPE_MAPPING = ModelConverter.COMPOSITE_TYPE_MAPPING | {
+        Point: {
+            "x": fields.Integer(allow_none=True),
+            "y": fields.Integer(allow_none=True),
+        }
+    }
 
 
 # Auto schemas with default options
@@ -750,3 +773,152 @@ def test_dumping_pickle_field(models, teacher):
     assert schema.dump(teacher) == {
         "data": {"foo": "bar"},
     }
+
+
+class TestCompositeFields:
+    @pytest.fixture
+    def location_model(self, Base):
+        class Location(Base):
+            __tablename__ = "location"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            x = sa.Column(sa.Integer, nullable=True)
+            y = sa.Column(sa.Integer, nullable=True)
+            position = composite(Point, x, y)
+
+        return Location
+
+    @pytest.fixture
+    def location_schema_class(self, location_model):
+        class LocationSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = location_model
+                model_converter = PointConverter
+                load_instance = True
+
+            x = fields.Integer(allow_none=True)
+
+        return LocationSchema
+
+    def test_sqlite_roundtrip(
+        self, Base, location_model, location_schema_class, engine
+    ):
+        Base.metadata.create_all(engine)
+        schema = location_schema_class(session=engine)
+        location_id = None
+
+        with sa.orm.Session(engine) as session:
+            location = schema.load(
+                {"position": {"x": 3, "y": 5}},
+                session=session,
+                transient=True,
+            )
+            session.add(location)
+            session.commit()
+            location_id = location.id
+
+        with sa.orm.Session(engine) as session:
+            loaded = session.get(location_model, location_id)
+            assert loaded.position == Point(3, 5)
+            assert schema.dump(loaded)["position"] == {"x": 3, "y": 5}
+
+    def test_none_and_partial_component_values(self, location_schema_class):
+        schema = location_schema_class(transient=True)
+
+        assert schema.load({"position": None}).position is None
+        assert schema.load({"position": {"x": 4}}).position == Point(4, None)
+
+    def test_invalid_component_leaves_existing_instance_unchanged(
+        self, location_model, location_schema_class
+    ):
+        location = location_model(id=1, x=3, y=5)
+        schema = location_schema_class(instance=location, transient=True)
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load({"position": {"x": "invalid", "y": 6}})
+
+        assert exc_info.value.messages == {
+            "position": {"x": ["Not a valid integer."]}
+        }
+        assert location.x == 3
+        assert location.y == 5
+        assert location.position == Point(3, 5)
+
+    def test_explicit_component_conflicts_are_rejected(
+        self, location_schema_class
+    ):
+        schema = location_schema_class(transient=True)
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load({"position": {"x": 3, "y": 5}, "x": 4})
+
+        assert exc_info.value.messages == {
+            "position": ["Conflicting values for 'x'."],
+            "x": ["Conflicting values for 'x'."],
+        }
+
+        assert schema.load({"position": {"x": 3, "y": 5}, "x": 3}).x == 3
+
+    def test_two_composites_conflict_on_shared_component(self, Base):
+        class Location(Base):
+            __tablename__ = "shared_composite_location"
+
+            id = sa.Column(sa.Integer, primary_key=True)
+            x = sa.Column(sa.Integer, nullable=True)
+            y = sa.Column(sa.Integer, nullable=True)
+            position = composite(Point, x, y)
+            reposition = composite(Point, x, y)
+
+        class LocationSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = Location
+                model_converter = PointConverter
+
+        schema = LocationSchema()
+
+        with pytest.raises(ValidationError) as exc_info:
+            schema.load(
+                {
+                    "position": {"x": 3, "y": 5},
+                    "reposition": {"x": 4, "y": 5},
+                }
+            )
+
+        assert exc_info.value.messages == {
+            "position": ["Conflicting values for 'x'."],
+            "reposition": ["Conflicting values for 'x'."],
+        }
+
+    def test_dump_only_composite_is_not_loaded(self, location_model):
+        class LocationSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = location_model
+                model_converter = PointConverter
+
+            position = auto_field(dump_only=True)
+
+        schema = LocationSchema()
+
+        assert "position" not in schema.load_fields
+        assert schema.dump(location_model(x=2, y=4))["position"] == {"x": 2, "y": 4}
+
+    def test_inherited_converter_configuration_does_not_change_parent(
+        self, location_model
+    ):
+        class LocationSchema(SQLAlchemyAutoSchema):
+            class Meta:
+                model = location_model
+                model_converter = PointConverter
+
+        class ChildLocationSchema(LocationSchema):
+            position = auto_field(dump_only=True)
+
+        parent_schema = LocationSchema()
+        child_schema = ChildLocationSchema()
+
+        assert isinstance(parent_schema.fields["position"], Composite)
+        assert isinstance(child_schema.fields["position"], Composite)
+        assert (
+            parent_schema.fields["position"].dump_only is False
+        )
+        assert child_schema.fields["position"].dump_only is True
