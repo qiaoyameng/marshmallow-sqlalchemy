@@ -5,9 +5,11 @@ from typing import TYPE_CHECKING, Any, cast
 import sqlalchemy as sa
 from marshmallow.fields import Field
 from marshmallow.schema import Schema, SchemaMeta, SchemaOpts
+from marshmallow.utils import missing
 
+from . import loaded_only
 from .convert import ModelConverter
-from .exceptions import IncorrectSchemaTypeError
+from .exceptions import IncorrectSchemaTypeError, UnloadedAttributeError
 from .load_instance_mixin import LoadInstanceMixin, _ModelType
 
 if TYPE_CHECKING:
@@ -68,10 +70,16 @@ class SQLAlchemySchemaOpts(LoadInstanceMixin.Opts, SchemaOpts):
     - ``transient``: Whether to load model instances in a transient state (effectively ignoring the session).
         Only relevant when ``load_instance`` is `True`.
     - ``model_converter``: `ModelConverter` class to use for converting the SQLAlchemy model to marshmallow fields.
+    - ``dump_loaded_only``: When `True`, dumps read only attributes already loaded
+        on the SQLAlchemy instance and never emit SQL. Defaults to `False`.
+    - ``unloaded_attribute``: What to do with attributes that are not loaded when
+        ``dump_loaded_only`` is enabled: ``"raise"`` (default) or ``"omit"``.
     """
 
     table: sa.Table | None
     model_converter: type[ModelConverter]
+    dump_loaded_only: bool
+    unloaded_attribute: str
 
     def __init__(self, meta, *args, **kwargs):
         super().__init__(meta, *args, **kwargs)
@@ -80,6 +88,16 @@ class SQLAlchemySchemaOpts(LoadInstanceMixin.Opts, SchemaOpts):
         if self.model is not None and self.table is not None:
             raise ValueError("Cannot set both `model` and `table` options.")
         self.model_converter = getattr(meta, "model_converter", ModelConverter)
+        self.dump_loaded_only = getattr(meta, "dump_loaded_only", False)
+        self.unloaded_attribute = getattr(
+            meta, "unloaded_attribute", loaded_only.RAISE
+        )
+        if self.unloaded_attribute not in loaded_only.VALID_STRATEGIES:
+            raise ValueError(
+                "`unloaded_attribute` must be one of "
+                f"{loaded_only.VALID_STRATEGIES}, got "
+                f"{self.unloaded_attribute!r}."
+            )
 
 
 class SQLAlchemyAutoSchemaOpts(SQLAlchemySchemaOpts):
@@ -249,6 +267,151 @@ class SQLAlchemySchema(
     """
 
     OPTIONS_CLASS = SQLAlchemySchemaOpts
+
+    def __init__(
+        self,
+        *args,
+        dump_loaded_only: bool | None = None,
+        unloaded_attribute: str | None = None,
+        **kwargs,
+    ):
+        """
+        :param dump_loaded_only: When `True`, dump only attributes already
+            loaded on SQLAlchemy instances, without emitting SQL. Overrides
+            the ``dump_loaded_only`` Meta option.
+        :param unloaded_attribute: ``"raise"`` or ``"omit"``. Overrides the
+            ``unloaded_attribute`` Meta option.
+        """
+        super().__init__(*args, **kwargs)
+        if dump_loaded_only is not None:
+            self._dump_loaded_only = dump_loaded_only
+        if unloaded_attribute is not None:
+            if unloaded_attribute not in loaded_only.VALID_STRATEGIES:
+                raise ValueError(
+                    "`unloaded_attribute` must be one of "
+                    f"{loaded_only.VALID_STRATEGIES}, got "
+                    f"{unloaded_attribute!r}."
+                )
+            self._unloaded_attribute = unloaded_attribute
+
+    @property
+    def dump_loaded_only(self) -> bool:
+        """Whether dumps only serialize already-loaded ORM attributes."""
+        return getattr(self, "_dump_loaded_only", self.opts.dump_loaded_only)
+
+    @property
+    def unloaded_attribute(self) -> str:
+        """Strategy (``"raise"`` or ``"omit"``) for unloaded attributes."""
+        return getattr(
+            self, "_unloaded_attribute", self.opts.unloaded_attribute
+        )
+
+    def _effective_loaded_only(self) -> loaded_only.LoadedOnlySettings:
+        """Resolve the settings for the dump in progress.
+
+        Settings pushed by a root schema take precedence so that nested
+        schemas inherit the strategy of the dump they participate in.
+        """
+        context = loaded_only._dump_context.get()
+        if context is not None:
+            return context
+        return loaded_only.LoadedOnlySettings(
+            enabled=self.dump_loaded_only,
+            strategy=self.unloaded_attribute,
+        )
+
+    def _serialize(self, obj: Any, *, many: bool = False) -> Any:
+        settings = self._effective_loaded_only()
+        already_active = loaded_only._dump_context.get() is not None
+        token = None
+        if settings.enabled and not already_active:
+            token = loaded_only._dump_context.set(settings)
+        try:
+            if many and obj is not None:
+                items = []
+                for index, item in enumerate(obj):
+                    try:
+                        items.append(self._serialize_one(item, settings))
+                    except UnloadedAttributeError as error:
+                        error.prepend_path(f"[{index}]")
+                        raise
+                return items
+            return self._serialize_one(obj, settings)
+        finally:
+            if token is not None:
+                loaded_only._dump_context.reset(token)
+
+    def _serialize_one(
+        self,
+        obj: Any,
+        settings: loaded_only.LoadedOnlySettings,
+    ) -> Any:
+        if not settings.enabled or not loaded_only.is_mapped_instance(obj):
+            # `None`, dicts or non-ORM instances: defer entirely to
+            # marshmallow's default behavior.
+            return Schema._serialize(self, obj, many=False)
+        ret = self.dict_class()
+        for attr_name, field_obj in self.dump_fields.items():
+            attribute = (
+                attr_name if field_obj.attribute is None else field_obj.attribute
+            )
+            if loaded_only.is_unloaded(obj, attribute):
+                if settings.strategy == loaded_only.OMIT:
+                    continue
+                key = (
+                    field_obj.data_key
+                    if field_obj.data_key is not None
+                    else attr_name
+                )
+                raise UnloadedAttributeError(
+                    path=key,
+                    attribute=attribute,
+                    model=type(obj),
+                    hint=loaded_only.detached_hint(obj),
+                )
+            try:
+                value = field_obj.serialize(
+                    attr_name, obj, accessor=self.get_attribute
+                )
+            except UnloadedAttributeError as error:
+                key = (
+                    field_obj.data_key
+                    if field_obj.data_key is not None
+                    else attr_name
+                )
+                error.prepend_path(key)
+                raise
+            if value is missing:
+                continue
+            key = (
+                field_obj.data_key
+                if field_obj.data_key is not None
+                else attr_name
+            )
+            ret[key] = value
+        return ret
+
+    def get_attribute(self, obj: Any, attr: str, default: Any = None) -> Any:
+        """Access ``attr`` on ``obj`` during a dump.
+
+        If a loaded-only dump is active and ``attr`` is a mapped but unloaded
+        attribute, fail or omit *before* touching ``getattr``. This guards
+        every code path that reads values (including custom fields and
+        properties), not just the top-level loop.
+        """
+        settings = self._effective_loaded_only()
+        if settings.enabled and loaded_only.is_mapped_instance(
+            obj
+        ) and loaded_only.is_unloaded(obj, attr):
+            if settings.strategy == loaded_only.OMIT:
+                return default
+            raise UnloadedAttributeError(
+                path=attr,
+                attribute=attr,
+                model=type(obj),
+                hint=loaded_only.detached_hint(obj),
+            )
+        return super().get_attribute(obj, attr, default)
 
 
 class SQLAlchemyAutoSchema(

@@ -4,6 +4,16 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add ``dump_loaded_only`` mode to ``SQLAlchemySchema``. When enabled, dumps
+  only serialize attributes already loaded on SQLAlchemy instances and emit
+  no SQL: deferred columns, expired attributes and unloaded relationships are
+  detected from the ORM state before access. Unloaded attributes either raise
+  ``UnloadedAttributeError`` (``unloaded_attribute = "raise"``, the default)
+  or are skipped (``unloaded_attribute = "omit"``). The strategy is inherited
+  by nested schemas and error messages include the full field path.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.

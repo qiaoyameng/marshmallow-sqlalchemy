@@ -116,6 +116,7 @@ Learn
     :caption: Learn
     :maxdepth: 2
 
+    loaded_only
     recipes
 
 API reference
