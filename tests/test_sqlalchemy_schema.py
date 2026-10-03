@@ -8,6 +8,7 @@ import sqlalchemy as sa
 from marshmallow import Schema, ValidationError, fields, validate
 from pytest_lazy_fixtures import lf
 
+import marshmallow_sqlalchemy
 from marshmallow_sqlalchemy import SQLAlchemyAutoSchema, SQLAlchemySchema, auto_field
 from marshmallow_sqlalchemy.exceptions import IncorrectSchemaTypeError
 from marshmallow_sqlalchemy.fields import Related
@@ -750,3 +751,524 @@ def test_dumping_pickle_field(models, teacher):
     assert schema.dump(teacher) == {
         "data": {"foo": "bar"},
     }
+
+
+# ---------------------------------------------------------------------------
+# Two-phase loading (validated update plans)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def nested_data(models, session):
+    school_a = models.School(id=1, name="School A")
+    school_b = models.School(id=2, name="School B")
+    student_a = models.Student(
+        id=10, full_name="Alice", dob=None, current_school=school_a
+    )
+    student_b = models.Student(
+        id=11, full_name="Bob", dob=None, current_school=school_b
+    )
+    session.add_all([school_a, school_b, student_a, student_b])
+    session.commit()
+    return {
+        "schools": (school_a, school_b),
+        "students": (student_a, student_b),
+    }
+
+
+@pytest.fixture
+def nested_schemas(models, session):
+    hook_calls = {"school": 0, "student": 0}
+
+    class SchoolSchema(SQLAlchemyAutoSchema[models.School]):
+        class Meta:
+            model = models.School
+            load_instance = True
+            sqla_session = session
+
+        name = auto_field(validate=validate.Length(max=20))
+
+        @marshmallow.post_load
+        def count_hook(self, data, **kwargs):
+            hook_calls["school"] += 1
+            return data
+
+    class StudentSchema(SQLAlchemyAutoSchema[models.Student]):
+        class Meta:
+            model = models.Student
+            load_instance = True
+            include_relationships = True
+            sqla_session = session
+
+        full_name = auto_field(validate=validate.Length(max=20))
+        current_school = marshmallow.fields.Nested(SchoolSchema)
+
+        @marshmallow.post_load
+        def count_hook(self, data, **kwargs):
+            hook_calls["student"] += 1
+            return data
+
+    schema = StudentSchema()
+    return schema, SchoolSchema, hook_calls
+
+
+def _listen_flushes(session):
+    flushes = []
+
+    def after_flush(sess, ctx):
+        flushes.append(len(sess.new) + len(sess.dirty))
+
+    sa.event.listen(session, "after_flush", after_flush)
+    return flushes
+
+
+def test_two_phase_failed_validation_leaves_objects_untouched(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, _ = nested_schemas
+    school_a, school_b = nested_data["schools"]
+    student_a, student_b = nested_data["students"]
+    flushes = _listen_flushes(session)
+
+    payload = [
+        {
+            "id": 10,
+            "full_name": "Alice X",
+            "current_school": {"id": 1, "name": "School A+1"},
+        },
+        {
+            "id": 11,
+            "full_name": "Bob X",
+            "current_school": {"id": 2, "name": "School B+1"},
+        },
+        # last record fails field validation
+        {
+            "id": 10,
+            "full_name": "x" * 21,
+            "current_school": {"id": 1, "name": "Never Applied"},
+        },
+    ]
+
+    with pytest.raises(ValidationError) as exc_info:
+        schema.load(payload, many=True, two_phase=True)
+    assert 2 in exc_info.value.messages
+
+    # scalars unchanged
+    assert student_a.full_name == "Alice"
+    assert student_b.full_name == "Bob"
+    assert school_a.name == "School A"
+    assert school_b.name == "School B"
+    # relationships unchanged (same identities)
+    assert student_a.current_school is school_a
+    assert student_b.current_school is school_b
+    # nothing dirty and nothing flushed
+    assert len(session.dirty) == 0
+    assert len(session.new) == 0
+    assert flushes == []
+
+
+def test_two_phase_success_applies_and_returns_identity_map_objects(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, hook_calls = nested_schemas
+    school_a, school_b = nested_data["schools"]
+    student_a, student_b = nested_data["students"]
+
+    payload = [
+        {
+            "id": 10,
+            "full_name": "Alice 2",
+            "current_school": {"id": 1, "name": "School A 2"},
+        },
+        {
+            "id": 11,
+            "full_name": "Bob 2",
+            "current_school": {"id": 2, "name": "School B 2"},
+        },
+    ]
+    results = schema.load(payload, many=True, two_phase=True)
+
+    assert results == [student_a, student_b]
+    assert results[0] is student_a
+    assert results[1] is student_b
+    assert student_a.full_name == "Alice 2"
+    assert student_b.full_name == "Bob 2"
+    assert student_a.current_school is school_a
+    assert school_a.name == "School A 2"
+    assert student_b.current_school is school_b
+    assert school_b.name == "School B 2"
+    # hooks ran exactly once per record (including nested)
+    assert hook_calls == {"school": 2, "student": 2}
+
+
+def test_two_phase_retry_does_not_run_hooks_twice(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, hook_calls = nested_schemas
+
+    bad_payload = [
+        {
+            "id": 10,
+            "full_name": "Alice X",
+            "current_school": {"id": 1, "name": "Tmp"},
+        },
+        {
+            "id": 11,
+            "full_name": "x" * 21,
+            "current_school": {"id": 2, "name": "Tmp"},
+        },
+    ]
+    with pytest.raises(ValidationError):
+        schema.load(bad_payload, many=True, two_phase=True)
+
+    hook_calls["school"] = 0
+    hook_calls["student"] = 0
+    good_payload = [
+        {
+            "id": 10,
+            "full_name": "Alice R",
+            "current_school": {"id": 1, "name": "School A R"},
+        },
+        {
+            "id": 11,
+            "full_name": "Bob R",
+            "current_school": {"id": 2, "name": "School B R"},
+        },
+    ]
+    schema.load(good_payload, many=True, two_phase=True)
+    # successful run alone executed every hook exactly once
+    assert hook_calls == {"school": 2, "student": 2}
+
+
+def test_two_phase_does_not_roll_back_unrelated_session_work(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, _ = nested_schemas
+    school_a, _ = nested_data["schools"]
+    student_a, student_b = nested_data["students"]
+
+    scratch = models.Student(
+        id=77, full_name="Scratch", dob=None, current_school_id=school_a.id
+    )
+    session.add(scratch)
+    session.flush()
+    scratch_id = id(scratch)
+
+    with pytest.raises(ValidationError):
+        schema.load(
+            [
+                {
+                    "id": 10,
+                    "full_name": "ok",
+                    "current_school": {"id": 1, "name": "x"},
+                },
+                {
+                    "id": 11,
+                    "full_name": "x" * 21,
+                    "current_school": {"id": 1, "name": "y"},
+                },
+            ],
+            many=True,
+            two_phase=True,
+        )
+
+    assert session.get(models.Student, 77) is scratch
+    assert id(session.get(models.Student, 77)) == scratch_id
+    assert student_a.full_name == "Alice"
+    assert student_b.full_name == "Bob"
+
+
+def test_two_phase_duplicate_target_raises_by_default_and_changes_nothing(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, _ = nested_schemas
+    school_a, _ = nested_data["schools"]
+    student_a, _ = nested_data["students"]
+
+    payload = [
+        {
+            "id": 10,
+            "full_name": "First",
+            "current_school": {"id": 1, "name": "S First"},
+        },
+        {
+            "id": 10,
+            "full_name": "Second",
+            "current_school": {"id": 1, "name": "S Second"},
+        },
+    ]
+    with pytest.raises(marshmallow_sqlalchemy.DuplicateTargetError) as exc_info:
+        schema.load(payload, many=True, two_phase=True)
+    # it is still catchable as a plain marshmallow ValidationError
+    assert isinstance(exc_info.value, ValidationError)
+    assert exc_info.value.model is models.Student
+    assert exc_info.value.identity == (10,)
+
+    assert student_a.full_name == "Alice"
+    assert school_a.name == "School A"
+    assert len(session.dirty) == 0
+
+
+def test_two_phase_duplicate_policies(models, session, nested_data, nested_schemas):
+    schema, _, _ = nested_schemas
+    school_a, _ = nested_data["schools"]
+    student_a, _ = nested_data["students"]
+
+    def payload():
+        return [
+            {
+                "id": 10,
+                "full_name": "First",
+                "current_school": {"id": 1, "name": "S First"},
+            },
+            {
+                "id": 10,
+                "full_name": "Second",
+                "current_school": {"id": 1, "name": "S Second"},
+            },
+        ]
+
+    results = schema.load(payload(), many=True, two_phase=True, on_duplicate="first")
+    assert results == [student_a]
+    assert student_a.full_name == "First"
+    assert school_a.name == "S First"
+    session.rollback()
+
+    results = schema.load(payload(), many=True, two_phase=True, on_duplicate="last")
+    assert results == [student_a]
+    assert student_a.full_name == "Second"
+    assert school_a.name == "S Second"
+    session.rollback()
+
+    results = schema.load(
+        [
+            {
+                "id": 10,
+                "full_name": "Merged",
+                "current_school": {"id": 1, "name": "S Merged"},
+            },
+            {
+                "id": 10,
+                "full_name": "Merged Again",
+                "current_school": {"id": 1, "name": "S Merged"},
+            },
+        ],
+        many=True,
+        two_phase=True,
+        on_duplicate="merge",
+    )
+    assert results == [student_a]
+    assert student_a.full_name == "Merged Again"
+    assert school_a.name == "S Merged"
+    session.rollback()
+
+
+def test_two_phase_shared_nested_target_is_not_a_duplicate(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, _ = nested_schemas
+    school_a, _ = nested_data["schools"]
+    student_a, student_b = nested_data["students"]
+
+    results = schema.load(
+        [
+            {
+                "id": 10,
+                "full_name": "Alice S",
+                "current_school": {"id": 1, "name": "Shared"},
+            },
+            {
+                "id": 11,
+                "full_name": "Bob S",
+                "current_school": {"id": 1, "name": "Shared"},
+            },
+        ],
+        many=True,
+        two_phase=True,
+    )
+    assert results == [student_a, student_b]
+    assert student_a.current_school is school_a
+    assert student_b.current_school is school_a
+    assert school_a.name == "Shared"
+
+
+def test_make_update_plan_is_applied_lazily_and_is_idempotent(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, _ = nested_schemas
+    _, school_b = nested_data["schools"]
+    student_a, student_b = nested_data["students"]
+
+    plan = schema.make_update_plan(
+        [
+            {
+                "id": 11,
+                "full_name": "Bob P",
+                "current_school": {"id": 2, "name": "School B P"},
+            }
+        ],
+        many=True,
+    )
+    # building the plan changes nothing
+    assert student_b.full_name == "Bob"
+    assert school_b.name == "School B"
+    assert len(session.dirty) == 0
+
+    first = plan.apply()
+    second = plan.apply()
+    assert first == second == [student_b]
+    assert first[0] is student_b
+
+
+def test_two_phase_single_record_with_instance(
+    models, session, nested_data, nested_schemas
+):
+    schema, _, _ = nested_schemas
+    school_a, _ = nested_data["schools"]
+    student_a, _ = nested_data["students"]
+
+    result = schema.load(
+        {
+            "id": 10,
+            "full_name": "Solo",
+            "current_school": {"id": 1, "name": "Solo School"},
+        },
+        two_phase=True,
+        instance=student_a,
+    )
+    assert result is student_a
+    assert student_a.full_name == "Solo"
+    assert student_a.current_school is school_a
+    assert school_a.name == "Solo School"
+
+
+def test_two_phase_invalid_on_duplicate_policy(models, session, nested_schemas):
+    schema, _, _ = nested_schemas
+    with pytest.raises(ValueError, match="on_duplicate"):
+        schema.load([{"id": 1}], many=True, two_phase=True, on_duplicate="bogus")
+
+
+def test_two_phase_requires_load_instance(models, session):
+    class PlainSchema(SQLAlchemyAutoSchema[models.Teacher]):
+        class Meta:
+            model = models.Teacher
+            sqla_session = session
+
+    with pytest.raises(ValueError, match="load_instance"):
+        PlainSchema().load([{"full_name": "x"}], many=True, two_phase=True)
+    with pytest.raises(ValueError, match="load_instance"):
+        PlainSchema().make_update_plan([{"full_name": "x"}], many=True)
+
+
+def test_two_phase_failure_inside_nested_many_changes_nothing(
+    models, session
+):
+    lecture = models.Lecture(id=3, topic="Old topic")
+    kw_one = models.Keyword(id=1, keyword="one")
+    kw_two = models.Keyword(id=2, keyword="two")
+    session.add_all([lecture, kw_one, kw_two])
+    session.flush()
+    lecture.kw = [kw_one, kw_two]
+    session.commit()
+
+    class KeywordSchema(SQLAlchemyAutoSchema[models.Keyword]):
+        class Meta:
+            model = models.Keyword
+            load_instance = True
+            sqla_session = session
+
+        keyword = auto_field(validate=validate.Length(max=10))
+
+    class LectureSchema(SQLAlchemyAutoSchema[models.Lecture]):
+        class Meta:
+            model = models.Lecture
+            load_instance = True
+            include_relationships = True
+            sqla_session = session
+
+        kw = marshmallow.fields.Nested(KeywordSchema, many=True)
+
+    schema = LectureSchema()
+    payload = [
+        {
+            "id": 3,
+            "topic": "New topic",
+            "kw": [
+                {"id": 1, "keyword": "updated one"},
+                {"id": 2, "keyword": "x" * 11},  # fails validation
+            ],
+        }
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        schema.load(payload, many=True, two_phase=True)
+    assert "kw" in exc_info.value.messages[0]
+
+    assert lecture.topic == "Old topic"
+    assert kw_one.keyword == "one"
+    assert kw_two.keyword == "two"
+    assert len(session.dirty) == 0
+
+
+def test_two_phase_transient_creates_objects_on_apply(models):
+    class TeacherSchema(SQLAlchemyAutoSchema[models.Teacher]):
+        class Meta:
+            model = models.Teacher
+            load_instance = True
+            transient = True
+
+    schema = TeacherSchema()
+    results = schema.load(
+        [{"full_name": "One"}, {"full_name": "Two"}],
+        many=True,
+        two_phase=True,
+    )
+    assert [teacher.full_name for teacher in results] == ["One", "Two"]
+    assert all(sa.inspect(teacher).transient for teacher in results)
+
+
+def test_two_phase_new_objects_are_not_created_during_planning(models, session):
+    class TeacherSchema(SQLAlchemyAutoSchema[models.Teacher]):
+        class Meta:
+            model = models.Teacher
+            load_instance = True
+            sqla_session = session
+
+    schema = TeacherSchema()
+    plan = schema.make_update_plan(
+        [{"full_name": "New One"}, {"full_name": "New Two"}], many=True
+    )
+    assert len(session.new) == 0
+    results = plan.apply()
+    assert [teacher.full_name for teacher in results] == ["New One", "New Two"]
+    assert all(isinstance(teacher, models.Teacher) for teacher in results)
+
+
+def test_two_phase_skips_flush_during_planning_with_related_field(
+    models, session, teacher
+):
+    class WithRelated(SQLAlchemyAutoSchema[models.Teacher]):
+        class Meta:
+            model = models.Teacher
+            load_instance = True
+            sqla_session = session
+
+        full_name = auto_field()
+        current_school = Related()
+
+    # unflushed caller work that an autoflush would otherwise emit
+    session.add(
+        models.Student(id=901, full_name="Pending", dob=None, current_school_id=42)
+    )
+    flushes = _listen_flushes(session)
+
+    schema = WithRelated()
+    results = schema.load(
+        [
+            {"id": 24, "full_name": "Teachy McTeachFace", "current_school": 42},
+        ],
+        many=True,
+        two_phase=True,
+    )
+    assert results[0] is teacher
+    assert flushes == []
+    session.rollback()

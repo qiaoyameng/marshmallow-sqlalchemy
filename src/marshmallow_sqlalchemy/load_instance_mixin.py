@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
@@ -17,6 +18,15 @@ from sqlalchemy.ext.declarative import DeclarativeMeta
 from sqlalchemy.orm.exc import ObjectDeletedError
 
 from .fields import get_primary_keys
+from .update_plan import (
+    VALID_POLICIES,
+    UpdatePlan,
+    _PlanContext,
+    active_plan_context,
+    in_nested_load,
+    make_pending_instance,
+    run_planning,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -93,11 +103,23 @@ class LoadInstanceMixin:
             props = get_primary_keys(model)
             filters = {prop.key: data.get(prop.key) for prop in props}
             if None not in filters.values():
-                try:
-                    return cast("Session", self.session).get(model, filters)
-                except ObjectDeletedError:
-                    return None
+                session = cast("Session | None", self.session)
+                with self._no_autoflush(session):
+                    try:
+                        return cast("Session", session).get(model, filters)
+                    except ObjectDeletedError:
+                        return None
             return None
+
+        @staticmethod
+        def _no_autoflush(session):
+            """Suppress autoflush during planning so validation never flushes.
+
+            Outside of a two-phase load autoflush behavior is left untouched.
+            """
+            if session is not None and active_plan_context() is not None:
+                return session.no_autoflush
+            return contextlib.nullcontext()
 
         @ma.post_load
         def make_instance(self, data, **kwargs) -> _ModelType:
@@ -111,6 +133,16 @@ class LoadInstanceMixin:
             if not self._load_instance:
                 return data
             instance = self.instance or self.get_instance(data)
+            plan_context = active_plan_context()
+            if plan_context is not None:
+                # Planning phase: record a validated change instead of
+                # touching any mapped instance.
+                return make_pending_instance(
+                    cast("DeclarativeMeta", self.opts.model),
+                    data,
+                    instance,
+                    is_root=not in_nested_load(),
+                )
             if instance is not None:
                 for key, value in data.items():
                     setattr(instance, key, value)
@@ -129,6 +161,8 @@ class LoadInstanceMixin:
             session: Session | None = None,
             instance: _ModelType | None = None,
             transient: bool = False,
+            two_phase: bool = False,
+            on_duplicate: str = "raise",
             **kwargs,
         ) -> Any:
             """Deserialize data. If ``load_instance`` is set to `True`
@@ -138,6 +172,14 @@ class LoadInstanceMixin:
             :param session: SQLAlchemy `session <sqlalchemy.orm.Session>`.
             :param instance: Existing model instance to modify.
             :param transient: If `True`, load transient model instance(s).
+            :param two_phase: If `True`, validate every input record first and
+                only apply the resulting, validated update plan once all
+                records pass validation. Existing instances are not modified
+                and the session is not flushed when validation fails.
+            :param on_duplicate: Conflict strategy used by ``two_phase``
+                loads when several input records resolve to the same existing
+                instance. One of ``"raise"`` (the default), ``"first"``,
+                ``"last"`` or ``"merge"``.
             :param kwargs: Same keyword arguments as `marshmallow.Schema.load`.
             """
             self._session = session or self._session
@@ -145,10 +187,85 @@ class LoadInstanceMixin:
             if self._load_instance and not (self.transient or self.session):
                 raise ValueError("Deserialization requires a session")
             self.instance = instance or self.instance
-            try:
-                return cast("ma.Schema", super()).load(_cast_data(data), **kwargs)
-            finally:
-                self.instance = None
+            if two_phase:
+                if on_duplicate not in VALID_POLICIES:
+                    raise ValueError(
+                        "on_duplicate must be one of "
+                        f"{', '.join(repr(p) for p in VALID_POLICIES)}"
+                    )
+                try:
+                    plan = self.make_update_plan(
+                        data, on_duplicate=on_duplicate, **kwargs
+                    )
+                    return plan.apply()
+                finally:
+                    self.instance = None
+            plan_context = active_plan_context()
+            nested_cm = (
+                plan_context.nested_load()
+                if plan_context is not None
+                else contextlib.nullcontext()
+            )
+            with nested_cm:
+                try:
+                    return cast("ma.Schema", super()).load(
+                        _cast_data(data), **kwargs
+                    )
+                finally:
+                    self.instance = None
+
+        def make_update_plan(
+            self,
+            data: _LoadDataT,
+            *,
+            session: Session | None = None,
+            instance: _ModelType | None = None,
+            transient: bool = False,
+            on_duplicate: str = "raise",
+            **kwargs,
+        ) -> UpdatePlan:
+            """Validate ``data`` and return an :class:`UpdatePlan` without
+            modifying any ORM instance or flushing the session.
+
+            All marshmallow hooks (field validators, schema validators and
+            ``post_load`` processors) run exactly once during planning; the
+            plan's :meth:`~UpdatePlan.apply` method performs the actual
+            instance updates without re-running those hooks.
+
+            :param data: The data to deserialize.
+            :param session: SQLAlchemy `session <sqlalchemy.orm.Session>`.
+            :param instance: Existing model instance a single record updates.
+            :param transient: If `True`, plan transient model instance(s).
+            :param on_duplicate: Strategy when several records resolve to the
+                same existing instance: ``"raise"`` (default), ``"first"``,
+                ``"last"`` or ``"merge"``.
+            :param kwargs: Same keyword arguments as `marshmallow.Schema.load`.
+            """
+            if on_duplicate not in VALID_POLICIES:
+                raise ValueError(
+                    "on_duplicate must be one of "
+                    f"{', '.join(repr(p) for p in VALID_POLICIES)}"
+                )
+            if not self._load_instance:
+                raise ValueError(
+                    "Two-phase loading requires load_instance to be enabled"
+                )
+            self._session = session or self._session
+            self._transient = transient or self._transient
+            if self._load_instance and not (self.transient or self.session):
+                raise ValueError("Deserialization requires a session")
+            self.instance = instance or self.instance
+            many = bool(kwargs.get("many", self.many))
+            context = _PlanContext(on_duplicate=on_duplicate)
+
+            def run():
+                try:
+                    ma.Schema.load(self, _cast_data(data), **kwargs)
+                finally:
+                    self.instance = None
+                return context.build(many=many)
+
+            return run_planning(run, context)
 
         def validate(
             self,

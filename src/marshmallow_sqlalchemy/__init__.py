@@ -5,7 +5,8 @@ from .convert import (
     fields_for_model,
     property2field,
 )
-from .exceptions import ModelConversionError
+from .exceptions import DuplicateTargetError, ModelConversionError
+from .update_plan import UpdatePlan
 from .schema import (
     SQLAlchemyAutoSchema,
     SQLAlchemyAutoSchemaOpts,
@@ -26,4 +27,6 @@ __all__ = [
     "field_for",
     "fields_for_model",
     "property2field",
+    "DuplicateTargetError",
+    "UpdatePlan",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import warnings
 from typing import TYPE_CHECKING, Any, cast
 
@@ -7,6 +8,8 @@ from marshmallow import fields
 from marshmallow.utils import is_iterable_but_not_string
 from sqlalchemy import inspect
 from sqlalchemy.orm.exc import NoResultFound
+
+from .update_plan import active_plan_context
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.declarative import DeclarativeMeta
@@ -120,24 +123,36 @@ class Related(fields.Field):
         :raises NoResultFound: if there is no matching record.
         """
         if self.columns:
-            result = (
-                self.session.query(related_model)
-                .filter_by(
-                    **{prop.key: value.get(prop.key) for prop in self.related_keys}
+            with self._no_autoflush:
+                result = (
+                    self.session.query(related_model)
+                    .filter_by(
+                        **{
+                            prop.key: value.get(prop.key)
+                            for prop in self.related_keys
+                        }
+                    )
+                    .one()
                 )
-                .one()
-            )
         else:
             # Use a faster path if the related key is the primary key.
             lookup_values = [value.get(prop.key) for prop in self.related_keys]
-            try:
-                result = self.session.get(related_model, lookup_values)
-            except TypeError as error:
-                keys = [prop.key for prop in self.related_keys]
-                raise self.make_error("invalid", value=value, keys=keys) from error
-            if result is None:
-                raise NoResultFound
+            with self._no_autoflush:
+                try:
+                    result = self.session.get(related_model, lookup_values)
+                except TypeError as error:
+                    keys = [prop.key for prop in self.related_keys]
+                    raise self.make_error("invalid", value=value, keys=keys) from error
+                if result is None:
+                    raise NoResultFound
         return result
+
+    @property
+    def _no_autoflush(self):
+        session = self.session
+        if session is not None and active_plan_context() is not None:
+            return session.no_autoflush
+        return contextlib.nullcontext()
 
 
 class Nested(fields.Nested):

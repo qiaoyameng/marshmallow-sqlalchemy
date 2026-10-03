@@ -424,3 +424,50 @@ You can override the schema ``load_instance`` flag by passing in a ``load_instan
     # <Author(name='John Steinbeck')>
     print(AuthorSchema(load_instance=False).load(dump_data))  # loading a dict
     # {"id": 1, "name": "John Steinbeck"}
+
+Two-phase (atomic) collection loading
+=====================================
+
+When loading a collection with ``many=True`` and ``load_instance=True``, each
+record is normally applied as soon as it has been deserialized. If a later
+record fails validation, earlier records may already have been modified. Pass
+``two_phase=True`` to validate every record first and only apply the changes
+once all records are valid:
+
+.. code-block:: python
+
+    authors = schema.load(
+        [
+            {"id": 1, "name": "Updated name"},
+            {"id": 2, "name": "Another update"},
+        ],
+        many=True,
+        two_phase=True,
+    )
+
+During the validation phase no ORM instance is modified, nothing is added to
+the session and no flush is triggered, so a failed validation leaves the
+session exactly as it was -- no ``session.rollback()`` is needed and unrelated
+pending work is preserved. Marshmallow hooks (``pre_load``, field/schema
+validators and ``post_load``) run once during validation; the apply step does
+not run them again. On success the returned objects are the same instances
+held in the session's identity map.
+
+When more than one record resolves to the same existing object, use the
+``on_duplicate`` option to declare the conflict strategy:
+
+- ``"raise"`` (default): raise :class:`marshmallow_sqlalchemy.DuplicateTargetError`
+  (a subclass of :class:`marshmallow.ValidationError`);
+- ``"first"``: keep the first record, ignore subsequent duplicates;
+- ``"last"``: keep the last record;
+- ``"merge"``: keep the first record and merge later records into it
+  (later values win per attribute).
+
+You can also build the validated plan explicitly and apply it yourself:
+
+.. code-block:: python
+
+    plan = schema.make_update_plan(data, many=True, on_duplicate="last")
+    # nothing has changed yet
+    authors = plan.apply()
+    # plan.apply() is idempotent and returns the same instances when called again

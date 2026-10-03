@@ -4,6 +4,16 @@ Changelog
 unreleased
 ++++++++++
 
+Features:
+
+* Add optional two-phase loading for collection loads. ``Schema.load(data,
+  many=True, two_phase=True)`` fully validates every input record before any
+  existing ORM object is modified or flushed, then applies the validated
+  :class:`UpdatePlan`. Duplicate targets in the same collection are handled
+  through the ``on_duplicate`` option (``"raise"``, ``"first"``, ``"last"`` or
+  ``"merge"``). The plan is also available directly through
+  ``Schema.make_update_plan``.
+
 Other changes:
 
 * Drop support for marshmallow 3, which is EOL.
